@@ -1,9 +1,11 @@
 """Workspace file tools exposed to the model (zero shell access), their schemas and the dispatcher."""
 
+import fnmatch
 import functools
 import inspect
 import json
 import os
+import re
 import stat
 import tempfile
 from pathlib import Path
@@ -15,6 +17,11 @@ from chippy.config import (
     READ_MAX_CHARS,
     READ_MAX_LINE_CHARS,
     READ_MAX_LINES,
+    SEARCH_MAX_FILE_BYTES,
+    SEARCH_MAX_FILES,
+    SEARCH_MAX_LINE_CHARS,
+    SEARCH_MAX_MATCHES,
+    WALK_SKIP_DIRS,
 )
 from chippy.sandbox import (
     check_listable,
@@ -23,6 +30,7 @@ from chippy.sandbox import (
     resolve_scoped_path,
     write_warnings,
 )
+from chippy.terminal import clip
 
 
 def _tool_errors(func):
@@ -109,6 +117,17 @@ def _iter_lines(f, max_chars: int):
             clipped = True
             line = f"{line}... [line clipped at {max_chars} chars]{ending}"
         yield line.replace("\r\n", "\n"), clipped
+
+
+def _walk_files(root: Path):
+    """Yields files under root (or root itself), sorted, skipping WALK_SKIP_DIRS. Symlinked dirs are not followed."""
+    if not root.is_dir():
+        yield root
+        return
+    for cur_root, dirs, names in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if d not in WALK_SKIP_DIRS)
+        for name in sorted(names):
+            yield Path(cur_root) / name
 
 
 # ==========================================
@@ -202,6 +221,59 @@ def tool_read_file(workspace: Path, file_path: str, offset=1, limit=READ_MAX_LIN
     if not notes:
         notes.append("Full file content" if offset == 1 else "End of file")
     result["note"] = " ".join(notes)
+    return result
+
+
+@_tool_errors
+def tool_search_files(workspace: Path, pattern: str, path: str = ".", glob: str = "", ignore_case=False) -> dict:
+    """Regex search over text files, returning 'path:line: text' hits so the model can read just those lines."""
+    if not isinstance(pattern, str) or not pattern:
+        return {"status": "error", "message": "'pattern' must be a non-empty string."}
+    try:
+        regex = re.compile(pattern, re.IGNORECASE if _as_bool(ignore_case) else 0)
+    except re.error as e:
+        return {"status": "error", "message": f"Invalid regular expression: {e}"}
+    root = check_listable(path or ".", workspace)
+    if not root.exists():
+        return {"status": "error", "message": f"Path '{path}' does not exist."}
+
+    base = workspace.resolve()
+    matches, files_matched, files_scanned, stop_reason = [], 0, 0, ""
+    for candidate in _walk_files(root):
+        rel = candidate.relative_to(base).as_posix()
+        if glob and not fnmatch.fnmatch(rel if "/" in glob else candidate.name, glob):
+            continue
+        try:
+            # Resolves symlinks and refuses secrets, exactly like read_file.
+            target = check_readable(rel, workspace)
+        except PermissionError:
+            continue
+        if not target.is_file() or target.stat().st_size > SEARCH_MAX_FILE_BYTES or _is_binary(target):
+            continue
+        if files_scanned >= SEARCH_MAX_FILES:
+            stop_reason = f"Stopped after scanning {SEARCH_MAX_FILES} files; narrow 'path' or 'glob'."
+            break
+        files_scanned += 1
+        found = False
+        with open(target, "r", encoding="utf-8", errors="replace", newline="") as f:
+            for line_no, (line, _) in enumerate(_iter_lines(f, READ_MAX_LINE_CHARS), start=1):
+                if not regex.search(line):
+                    continue
+                if len(matches) >= SEARCH_MAX_MATCHES:
+                    stop_reason = f"Showing the first {SEARCH_MAX_MATCHES} matches; narrow the pattern, 'path' or 'glob'."
+                    break
+                found = True
+                matches.append(f"{rel}:{line_no}: {clip(line.rstrip(), SEARCH_MAX_LINE_CHARS)}")
+        files_matched += found
+        if stop_reason:
+            break
+
+    result = {"status": "success", "matches": matches, "files_matched": files_matched}
+    if stop_reason:
+        result["truncated"] = True
+        result["note"] = stop_reason
+    elif not matches:
+        result["note"] = f"No matches in {files_scanned} file(s) searched."
     return result
 
 
@@ -301,6 +373,7 @@ _REGISTRY = (
         "name": "read_file",
         "description": (
             f"Read a UTF-8 text file, at most {READ_MAX_LINES} lines per call. "
+            "Read only the lines you need (offset/limit, e.g. around a search_files hit) instead of whole files. "
             "If the result has has_more=true, call again with offset=next_offset to read the rest. "
             "Always read the whole file before rewriting it with write_file."
         ),
@@ -312,6 +385,24 @@ _REGISTRY = (
                 "limit": {"type": "integer", "description": f"Maximum lines to return (1-{READ_MAX_LINES}). Defaults to {READ_MAX_LINES}."},
             },
             "required": ["file_path"],
+        },
+    }),
+    (tool_search_files, {
+        "name": "search_files",
+        "description": (
+            f"Search text files for a regular expression (Python syntax). Returns up to {SEARCH_MAX_MATCHES} "
+            "'path:line: text' matches. Use it to find where something is defined or used, then read_file "
+            "just those lines with offset/limit."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Regular expression to search for."},
+                "path": {"type": "string", "description": "Relative file or directory to search. Defaults to the workspace root."},
+                "glob": {"type": "string", "description": "Only search files matching this pattern, e.g. '*.py' or 'src/*.ts'."},
+                "ignore_case": {"type": "boolean", "description": "Case-insensitive search."},
+            },
+            "required": ["pattern"],
         },
     }),
     (tool_write_file, {
@@ -351,22 +442,71 @@ _REGISTRY = (
 TOOL_HANDLERS = {schema["name"]: handler for handler, schema in _REGISTRY}
 TOOLS = [{"type": "function", "function": schema} for _, schema in _REGISTRY]
 
+# The explore sub-agent gets these only: it gathers context and never changes files.
+READ_ONLY_TOOL_NAMES = ("list_directory", "read_file", "search_files")
+READ_ONLY_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] in READ_ONLY_TOOL_NAMES]
 
-def dispatch_tool(name: str, raw_arguments, workspace: Path) -> dict:
-    """Runs one model tool call. Bad names or arguments become error results the model can correct."""
-    handler = TOOL_HANDLERS.get(name)
-    if handler is None:
-        return {"status": "error", "message": f"Unknown tool: {name!r}. Available tools: {', '.join(TOOL_HANDLERS)}."}
+# Run by the agent loop rather than dispatch_tool, since it starts a sub-agent (see explore.py).
+EXPLORE_TOOL_NAME = "explore"
+EXPLORE_TOOL = {"type": "function", "function": {
+    "name": EXPLORE_TOOL_NAME,
+    "description": (
+        "Hand a context-gathering task to a read-only sub-agent with a fresh context. It searches and reads "
+        "the workspace and returns a compact brief: the relevant file:line ranges with verbatim snippets, "
+        "applicable AGENTS.md rules, assumptions, and the user's answers to any blocking questions. "
+        "Use it before multi-file changes or when you don't know where the relevant code is; "
+        "skip it for small, local tasks."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task": {
+                "type": "string",
+                "description": "What you are about to do and what you need to know to do it.",
+            },
+        },
+        "required": ["task"],
+    },
+}}
+AGENT_TOOLS = TOOLS + [EXPLORE_TOOL]
 
+
+def parse_tool_arguments(raw_arguments) -> tuple:
+    """Returns (arguments dict, None) or (None, error result)."""
     if isinstance(raw_arguments, dict):
         args = raw_arguments
     else:
         try:
             args = json.loads(raw_arguments) if raw_arguments else {}
         except (TypeError, ValueError) as e:
-            return {"status": "error", "message": f"Arguments are not valid JSON ({e}). Retry with a JSON object."}
+            return None, {"status": "error", "message": f"Arguments are not valid JSON ({e}). Retry with a JSON object."}
     if not isinstance(args, dict):
-        return {"status": "error", "message": "Arguments must be a JSON object."}
+        return None, {"status": "error", "message": "Arguments must be a JSON object."}
+    return args, None
+
+
+def tool_result_message(call: dict, result: dict) -> dict:
+    return {
+        "role": "tool",
+        "tool_call_id": call.get("id"),
+        "name": (call.get("function") or {}).get("name") or "",
+        "content": json.dumps(result),
+    }
+
+
+def dispatch_tool(name: str, raw_arguments, workspace: Path, allowed=None) -> dict:
+    """
+    Runs one model tool call, limited to the `allowed` tool names if given.
+    Bad names or arguments become error results the model can correct.
+    """
+    available = tuple(TOOL_HANDLERS) if allowed is None else tuple(allowed)
+    handler = TOOL_HANDLERS.get(name) if name in available else None
+    if handler is None:
+        return {"status": "error", "message": f"Unknown tool: {name!r}. Available tools: {', '.join(available)}."}
+
+    args, error = parse_tool_arguments(raw_arguments)
+    if error:
+        return error
 
     try:
         inspect.signature(handler).bind(workspace, **args)

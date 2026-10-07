@@ -9,9 +9,20 @@ clone, no install and no other files. Copy it (or open it raw and paste it into 
 on any machine and run:
 
 ```sh
-export OPENAI_API_KEY=...            # LLM_BASE_URL and LLM_MODEL are optional
+export OPENAI_API_KEY=...            # LLM_BASE_URL, LLM_MODEL and LLM_EXPLORE_MODEL are optional
 python3 chippy.py -d path/to/project
 ```
+
+## Keeping context small
+
+- `search_files` finds `path:line` hits so the agent reads only the lines it needs.
+- `explore` hands context gathering to a read-only sub-agent with a fresh conversation
+  (optionally a cheaper model, `--explore-model`). Only its brief (file:line ranges, verbatim
+  snippets, applicable `AGENTS.md` rules, and your answers to any blocking questions) reaches
+  the main agent.
+- Bulky tool output older than the previous request is replaced by a stub.
+- A long `AGENTS.md` is sent as an outline of its sections, which the agent reads on demand.
+- Token usage is printed after every request.
 
 `chippy.py` is generated from the `chippy/` package. Don't edit it by hand.
 
@@ -25,8 +36,9 @@ python3 chippy.py -d path/to/project
 | `chippy/terminal.py` | Escaping model output before it reaches the terminal |
 | `chippy/approval.py` | Diff-based human approval prompt |
 | `chippy/tools.py` | File tools, their schemas and the dispatcher |
-| `chippy/context.py` | System prompt: inventory and `AGENTS.md` |
-| `chippy/llm.py` | Chat completions client with timeouts and retries |
+| `chippy/context.py` | System prompts: inventory and `AGENTS.md` (verbatim or outline) |
+| `chippy/llm.py` | Chat completions client with timeouts and retries, token usage |
+| `chippy/explore.py` | Read-only explore sub-agent that returns a compact brief |
 | `chippy/agent.py` | Interactive loop |
 | `chippy/__main__.py` | CLI entry point |
 | `scripts/build.py` | Bundler: `chippy/` → `chippy.py` |

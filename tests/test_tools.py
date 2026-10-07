@@ -174,7 +174,50 @@ class ListDirectoryTests(WorkspaceTestCase):
         self.assertEqual(C.tool_list_directory(self.ws, ".git")["status"], "denied")
 
 
+class SearchFilesTests(WorkspaceTestCase):
+    def test_finds_matches_with_line_numbers(self):
+        self.write("src/a.py", "import os\ndef run():\n    pass\n")
+        self.write("src/b.py", "def run_all():\n")
+        self.write("notes.txt", "def run\n")
+        result = C.tool_search_files(self.ws, r"def run", glob="*.py")
+        self.assertEqual(result["matches"], ["src/a.py:2: def run():", "src/b.py:1: def run_all():"])
+        self.assertEqual(result["files_matched"], 2)
+
+    def test_path_glob_and_ignore_case(self):
+        self.write("src/a.py", "TODO\n")
+        self.write("lib/a.py", "todo\n")
+        result = C.tool_search_files(self.ws, "todo", glob="lib/*", ignore_case=True)
+        self.assertEqual(result["matches"], ["lib/a.py:1: todo"])
+        self.assertEqual(C.tool_search_files(self.ws, "TODO", path="src/a.py")["matches"], ["src/a.py:1: TODO"])
+
+    def test_skips_secrets_binary_git_and_escaping_symlinks(self):
+        self.write(".env", "needle\n")
+        self.write("img.bin", data=b"needle\x00")
+        self.write(".git/config", "needle\n")
+        (self.root / "outside.txt").write_text("needle\n")
+        os.symlink(self.root / "outside.txt", self.ws / "escape.txt")
+        result = C.tool_search_files(self.ws, "needle")
+        self.assertEqual(result["matches"], [])
+        self.assertIn("No matches", result["note"])
+
+    def test_match_cap(self):
+        self.write("many.txt", "hit\n" * (C.SEARCH_MAX_MATCHES + 5))
+        result = C.tool_search_files(self.ws, "hit")
+        self.assertEqual(len(result["matches"]), C.SEARCH_MAX_MATCHES)
+        self.assertTrue(result["truncated"])
+
+    def test_invalid_regex_and_escape(self):
+        self.assertIn("Invalid regular expression", C.tool_search_files(self.ws, "(")["message"])
+        self.assertEqual(C.tool_search_files(self.ws, "x", path="..")["status"], "denied")
+
+
 class DispatchTests(WorkspaceTestCase):
+    def test_allowed_restricts_tools(self):
+        args = '{"file_path": "a", "content": "x"}'
+        result = C.dispatch_tool("write_file", args, self.ws, allowed=C.READ_ONLY_TOOL_NAMES)
+        self.assertIn("Unknown tool", result["message"])
+        self.assertFalse((self.ws / "a").exists())
+
     def test_malformed_json(self):
         result = C.dispatch_tool("read_file", '{"file_path": ', self.ws)
         self.assertEqual(result["status"], "error")

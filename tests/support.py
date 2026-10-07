@@ -52,11 +52,14 @@ def quiet():
     return stack
 
 
-def api_response(content=None, tool_calls=None) -> bytes:
+def api_response(content=None, tool_calls=None, usage=None) -> bytes:
     message = {"role": "assistant", "content": content}
     if tool_calls:
         message["tool_calls"] = tool_calls
-    return json.dumps({"choices": [{"message": message}]}).encode("utf-8")
+    body = {"choices": [{"message": message}]}
+    if usage:
+        body["usage"] = usage
+    return json.dumps(body).encode("utf-8")
 
 
 def tool_call(call_id: str, name: str, arguments) -> dict:

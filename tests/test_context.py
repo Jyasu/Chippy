@@ -10,6 +10,21 @@ class AgentsMdTests(WorkspaceTestCase):
         self.assertEqual(status, "Detected")
         self.assertIn("Use tabs.", prompt)
 
+    def test_long_file_sent_as_outline(self):
+        body = "x" * C.AGENTS_MD_INLINE_CHARS
+        self.write("AGENTS.md", f"Intro\n# Style\n{body}\n```\n# not a heading\n```\n## Testing\nRun tests.\n")
+        prompt, status = C.build_system_context(self.ws)
+        self.assertIn("outline of 3 sections", status)
+        self.assertNotIn(body, prompt)
+        self.assertEqual(C.outline_markdown((self.ws / "AGENTS.md").read_text()),
+                         ["L1-1: (text before the first heading)", "L2-6: # Style", "L7-8: ## Testing"])
+
+    def test_long_file_without_headings_truncated(self):
+        self.write("AGENTS.md", "rule\n" * C.AGENTS_MD_INLINE_CHARS)
+        prompt, status = C.build_system_context(self.ws)
+        self.assertIn("truncated", status)
+        self.assertIn("read the rest with read_file", prompt)
+
     def test_missing(self):
         prompt, status = C.build_system_context(self.ws)
         self.assertEqual(status, "None")

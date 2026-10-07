@@ -28,8 +28,9 @@ class CallLlmApiTests(unittest.TestCase):
                 self.urlopen = urlopen
 
     def test_retries_transient_errors(self):
-        message, urlopen = self.call(http_error(503), urllib.error.URLError("reset"), FakeResponse(api_response("hi")))
+        (message, usage), urlopen = self.call(http_error(503), urllib.error.URLError("reset"), FakeResponse(api_response("hi")))
         self.assertEqual(message["content"], "hi")
+        self.assertEqual(usage, {})
         self.assertEqual(urlopen.call_count, 3)
         self.assertEqual(self.sleep.call_count, 2)
 
@@ -65,3 +66,27 @@ class CallLlmApiTests(unittest.TestCase):
         request = urlopen.call_args.args[0]
         self.assertEqual(request.get_header("Authorization"), "Bearer k")
         self.assertEqual(json.loads(request.data)["temperature"], 0.3)
+
+    def test_returns_usage_and_sends_tool_choice(self):
+        reported = {"prompt_tokens": 10, "completion_tokens": 2}
+        with quiet(), mock.patch("urllib.request.urlopen", return_value=FakeResponse(api_response("hi", usage=reported))) as urlopen:
+            _, usage = C.call_llm_api([], [], self.settings, tool_choice="none")
+        self.assertEqual(usage, reported)
+        self.assertEqual(json.loads(urlopen.call_args.args[0].data)["tool_choice"], "none")
+
+
+class UsageTests(unittest.TestCase):
+    def test_sums_calls_and_tracks_largest_prompt(self):
+        usage = C.Usage()
+        usage.add({"prompt_tokens": 100, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 80}})
+        usage.add({"prompt_tokens": 300, "completion_tokens": 7}, explore=True)
+        usage.add({"prompt_tokens": 200, "completion_tokens": None, "prompt_tokens_details": None})
+        self.assertEqual((usage.calls, usage.explore_calls), (3, 1))
+        self.assertEqual((usage.prompt_tokens, usage.cached_tokens, usage.completion_tokens), (600, 80, 12))
+        self.assertEqual(usage.peak_prompt_tokens, 300)
+        self.assertIn("3 model calls (1 by explore)", usage.summary())
+
+    def test_unreported_usage(self):
+        usage = C.Usage()
+        usage.add({})
+        self.assertIn("did not report", usage.summary())

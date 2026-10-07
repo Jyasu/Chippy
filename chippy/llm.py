@@ -7,6 +7,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 
 from chippy.config import (
     HTTP_MAX_BACKOFF_SECONDS,
@@ -55,7 +56,8 @@ def _post_with_retries(url: str, body: bytes, headers: dict) -> bytes:
     raise AssertionError("unreachable")
 
 
-def _parse_response(raw: bytes) -> dict:
+def _parse_response(raw: bytes) -> tuple:
+    """Returns (assistant message, usage dict; empty when the API reports none)."""
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as e:
@@ -68,16 +70,20 @@ def _parse_response(raw: bytes) -> dict:
         raise LLMError(f"Unexpected API response: {str(data)[:500]}") from None
     if not isinstance(message, dict):
         raise LLMError(f"Unexpected API response: {str(data)[:500]}")
-    return message
+    usage = data.get("usage")
+    return message, usage if isinstance(usage, dict) else {}
 
 
-def call_llm_api(messages: list, tools: list, settings: Settings) -> dict:
-    """Sends the conversation and returns the assistant message. Raises LLMError on failure."""
+def call_llm_api(messages: list, tools: list, settings: Settings, tool_choice: str = "auto") -> tuple:
+    """
+    Sends the conversation and returns (assistant message, usage dict).
+    Raises LLMError on failure.
+    """
     payload = {
         "model": settings.model,
         "messages": messages,
         "tools": tools,
-        "tool_choice": "auto",
+        "tool_choice": tool_choice,
     }
     # Some models (e.g. reasoning models) reject temperature, so it is only sent when set.
     if settings.temperature is not None:
@@ -88,3 +94,41 @@ def call_llm_api(messages: list, tools: list, settings: Settings) -> dict:
 
     raw = _post_with_retries(settings.url, json.dumps(payload).encode("utf-8"), headers)
     return _parse_response(raw)
+
+
+def _token_count(value) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+@dataclass
+class Usage:
+    """Token counts summed over the model calls of one request, as reported by the API."""
+    calls: int = 0
+    explore_calls: int = 0
+    reported: int = 0
+    prompt_tokens: int = 0
+    cached_tokens: int = 0
+    completion_tokens: int = 0
+    peak_prompt_tokens: int = 0
+
+    def add(self, usage: dict, explore: bool = False) -> None:
+        self.calls += 1
+        self.explore_calls += explore
+        if not usage:
+            return
+        self.reported += 1
+        prompt = _token_count(usage.get("prompt_tokens"))
+        details = usage.get("prompt_tokens_details")
+        self.prompt_tokens += prompt
+        self.cached_tokens += _token_count(details.get("cached_tokens")) if isinstance(details, dict) else 0
+        self.completion_tokens += _token_count(usage.get("completion_tokens"))
+        self.peak_prompt_tokens = max(self.peak_prompt_tokens, prompt)
+
+    def summary(self) -> str:
+        calls = f"{self.calls} model call{'s' if self.calls != 1 else ''}"
+        if self.explore_calls:
+            calls += f" ({self.explore_calls} by explore)"
+        if not self.reported:
+            return f"[Usage] {calls}; the API did not report token counts."
+        return (f"[Usage] {calls} | prompt {self.prompt_tokens:,} tokens ({self.cached_tokens:,} cached)"
+                f" | completion {self.completion_tokens:,} | largest prompt {self.peak_prompt_tokens:,}")
