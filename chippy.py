@@ -30,7 +30,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -59,6 +59,7 @@ SEARCH_MAX_MATCHES = 100
 SEARCH_MAX_FILES = 5000
 SEARCH_MAX_FILE_BYTES = 1024 * 1024
 SEARCH_MAX_LINE_CHARS = 300
+SEARCH_MAX_CONTEXT_LINES = 5
 
 # AGENTS.md up to this size goes into the prompt verbatim; longer files are sent as an outline.
 AGENTS_MD_INLINE_CHARS = 8 * 1024
@@ -69,8 +70,28 @@ INVENTORY_MAX_DEPTH = 3
 # Skipped by the inventory and by search_files.
 WALK_SKIP_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv"})
 
-# Tool results at least this long are replaced by a stub once they are more than one request old.
+# Elision: tool results at least ELIDE_MIN_CHARS long, and string arguments of tool calls
+# (write_file content, edit_file strings) at least ELIDE_ARG_MIN_CHARS long, become short stubs.
 ELIDE_MIN_CHARS = 1000
+ELIDE_ARG_MIN_CHARS = 300
+
+# Context window management. Sizes are API-reported prompt tokens when available,
+# otherwise estimated at CHARS_PER_TOKEN characters per token.
+DEFAULT_CONTEXT_LIMIT = 128_000
+MIN_CONTEXT_LIMIT = 4_000
+CHARS_PER_TOKEN = 4
+COMPACT_TRIGGER_RATIO = 0.8     # auto-compact once the conversation reaches this share of the limit
+COMPACT_TARGET_RATIO = 0.5      # summarize if eliding alone doesn't get it below this share
+COMPACT_KEEP_STEPS = 2          # the latest model steps are always kept verbatim
+COMPACT_SUMMARY_INPUT_RATIO = 0.5
+COMPACT_TRANSCRIPT_ARG_CHARS = 300
+COMPACT_TRANSCRIPT_RESULT_CHARS = 1500
+
+# Explore sub-agent limits.
+EXPLORE_MODES = ("auto", "always", "never")
+EXPLORE_READ_MAX_LINES = 200
+EXPLORE_CONTEXT_RATIO = 0.5     # the explorer must report once its own context reaches this share
+EXPLORE_SNIPPET_MAX_LINES = 80
 
 # Diff lines shown before the approval prompt; the rest is available on request.
 APPROVAL_DIFF_PREVIEW_LINES = 200
@@ -91,6 +112,272 @@ class Settings:
     max_steps: int = DEFAULT_MAX_STEPS
     explore_model: str = ""
     explore_max_steps: int = DEFAULT_EXPLORE_MAX_STEPS
+    explore_mode: str = "auto"
+    context_limit: int = DEFAULT_CONTEXT_LIMIT
+    log_path: str = ""
+
+
+# ==================== chippy/llm.py ====================
+
+RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+# How OpenAI-compatible servers word "the prompt is larger than the context window".
+CONTEXT_ERROR_MARKERS = (
+    "context_length_exceeded", "maximum context length", "context length", "context window",
+    "too many tokens", "prompt is too long", "input is too long", "reduce the length",
+)
+
+
+class LLMError(Exception):
+    """The API call failed and retrying will not help. The conversation is left intact."""
+
+
+class ContextLengthError(LLMError):
+    """The request did not fit in the model's context window."""
+
+
+def estimate_tokens(value) -> int:
+    """Rough token count for messages or tool schemas, for when the API reports none."""
+    return len(json.dumps(value, ensure_ascii=False)) // CHARS_PER_TOKEN
+
+
+def _backoff_delay(attempt: int, retry_after=None) -> float:
+    if retry_after:
+        try:
+            return min(float(retry_after), HTTP_MAX_BACKOFF_SECONDS)
+        except ValueError:
+            pass  # HTTP-date form; fall back to exponential backoff
+    return min(2 ** attempt, HTTP_MAX_BACKOFF_SECONDS) * (0.5 + random.random() / 2)
+
+
+def _post_with_retries(url: str, body: bytes, headers: dict) -> bytes:
+    for attempt in range(HTTP_MAX_RETRIES + 1):
+        retry_after = None
+        try:
+            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")[:2000]
+            if e.code in (400, 413) and any(marker in detail.lower() for marker in CONTEXT_ERROR_MARKERS):
+                raise ContextLengthError(f"API error {e.code}: {detail}") from e
+            if e.code not in RETRYABLE_STATUS_CODES or attempt == HTTP_MAX_RETRIES:
+                raise LLMError(f"API error {e.code}: {detail}") from e
+            reason = f"HTTP {e.code}"
+            retry_after = e.headers.get("Retry-After") if e.headers else None
+        except (OSError, http.client.HTTPException) as e:  # URLError, timeouts, dropped connections
+            detail = getattr(e, "reason", None) or e
+            if attempt == HTTP_MAX_RETRIES:
+                raise LLMError(f"Network error: {detail}") from e
+            reason = f"network error: {detail}"
+        delay = _backoff_delay(attempt, retry_after)
+        print(f"[{reason}] retrying in {delay:.1f}s ({attempt + 1}/{HTTP_MAX_RETRIES})", file=sys.stderr)
+        time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
+def _parse_response(raw: bytes) -> tuple:
+    """Returns (assistant message, usage dict; empty when the API reports none)."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as e:
+        raise LLMError(f"API returned invalid JSON: {e}") from e
+    if isinstance(data, dict) and data.get("error"):
+        raise LLMError(f"API error: {data['error']}")
+    try:
+        message = data["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        raise LLMError(f"Unexpected API response: {str(data)[:500]}") from None
+    if not isinstance(message, dict):
+        raise LLMError(f"Unexpected API response: {str(data)[:500]}")
+    usage = data.get("usage")
+    return message, usage if isinstance(usage, dict) else {}
+
+
+def _log_call(settings: Settings, source: str, messages: list, usage: dict) -> None:
+    """Appends one JSON line per model call to settings.log_path, for comparing runs."""
+    if not settings.log_path:
+        return
+    record = {
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "source": source,
+        "model": settings.model,
+        "messages": len(messages),
+        "usage": usage,
+    }
+    try:
+        with open(settings.log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError as e:
+        print(f"[Log] Could not write {settings.log_path}: {e}", file=sys.stderr)
+
+
+def call_llm_api(messages: list, tools: list, settings: Settings, tool_choice="auto", source: str = "main") -> tuple:
+    """
+    Sends the conversation and returns (assistant message, usage dict). When the API
+    reports no usage, the dict holds 'estimated_prompt_tokens' instead. `source` labels
+    the call in the log. Raises LLMError (ContextLengthError if the prompt was too big).
+    """
+    payload = {"model": settings.model, "messages": messages}
+    # Servers reject tool_choice without tools.
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = tool_choice
+    # Some models (e.g. reasoning models) reject temperature, so it is only sent when set.
+    if settings.temperature is not None:
+        payload["temperature"] = settings.temperature
+    headers = {"Content-Type": "application/json"}
+    if settings.api_key:
+        headers["Authorization"] = f"Bearer {settings.api_key}"
+
+    raw = _post_with_retries(settings.url, json.dumps(payload).encode("utf-8"), headers)
+    message, usage = _parse_response(raw)
+    if not usage:
+        usage = {"estimated_prompt_tokens": estimate_tokens(messages) + estimate_tokens(tools)}
+    _log_call(settings, source, messages, usage)
+    return message, usage
+
+
+def token_count(value) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def prompt_size(usage: dict) -> int:
+    """The prompt's size in tokens: as reported, or estimated when the API reported nothing."""
+    return token_count(usage.get("prompt_tokens")) or token_count(usage.get("estimated_prompt_tokens"))
+
+
+USAGE_SOURCE_LABELS = {"explore": "by explore", "compact": "for compaction"}
+
+
+@dataclass
+class Usage:
+    """Token counts summed over model calls, as reported by the API (or estimated when it reports none)."""
+    calls: int = 0
+    by_source: dict = field(default_factory=dict)
+    estimated: int = 0
+    prompt_tokens: int = 0
+    cached_tokens: int = 0
+    completion_tokens: int = 0
+    peak_prompt_tokens: int = 0
+
+    def add(self, usage: dict, source: str = "main") -> None:
+        self.calls += 1
+        self.by_source[source] = self.by_source.get(source, 0) + 1
+        prompt = prompt_size(usage)
+        self.estimated += "prompt_tokens" not in usage
+        details = usage.get("prompt_tokens_details")
+        self.prompt_tokens += prompt
+        self.cached_tokens += token_count(details.get("cached_tokens")) if isinstance(details, dict) else 0
+        self.completion_tokens += token_count(usage.get("completion_tokens"))
+        self.peak_prompt_tokens = max(self.peak_prompt_tokens, prompt)
+
+    def merge(self, other: "Usage") -> None:
+        self.calls += other.calls
+        for source, count in other.by_source.items():
+            self.by_source[source] = self.by_source.get(source, 0) + count
+        self.estimated += other.estimated
+        self.prompt_tokens += other.prompt_tokens
+        self.cached_tokens += other.cached_tokens
+        self.completion_tokens += other.completion_tokens
+        self.peak_prompt_tokens = max(self.peak_prompt_tokens, other.peak_prompt_tokens)
+
+    def summary(self, label: str = "[Usage]") -> str:
+        calls = f"{self.calls} model call{'s' if self.calls != 1 else ''}"
+        extra = [f"{count} {USAGE_SOURCE_LABELS.get(source, source)}"
+                 for source, count in sorted(self.by_source.items()) if source != "main"]
+        if extra:
+            calls += f" ({', '.join(extra)})"
+        prompt = f"prompt {'~' if self.estimated else ''}{self.prompt_tokens:,} tokens"
+        if self.cached_tokens:
+            prompt += f" ({self.cached_tokens:,} cached)"
+        parts = [calls, prompt]
+        if self.estimated < self.calls:
+            parts.append(f"completion {self.completion_tokens:,}")
+        parts.append(f"largest prompt {self.peak_prompt_tokens:,}")
+        if self.estimated:
+            parts.append(f"~ estimated for {self.estimated} call{'s' if self.estimated != 1 else ''} without API usage")
+        return f"{label} " + " | ".join(parts)
+
+
+# ==================== chippy/terminal.py ====================
+
+def sanitize(text) -> str:
+    """
+    Escapes control characters (ANSI escapes, carriage returns, bidi overrides) so
+    model output cannot redraw the terminal or spoof the approval prompt.
+    """
+    out = []
+    for ch in str(text):
+        if ch in "\n\t" or ch.isprintable():
+            out.append(ch)
+            continue
+        code = ord(ch)
+        if code <= 0xFF:
+            out.append(f"\\x{code:02x}")
+        elif code <= 0xFFFF:
+            out.append(f"\\u{code:04x}")
+        else:
+            out.append(f"\\U{code:08x}")
+    return "".join(out)
+
+
+def clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+# ==================== chippy/approval.py ====================
+
+def _diff_lines(old_text: str, new_text: str, label: str) -> list:
+    return list(difflib.unified_diff(
+        old_text.splitlines(), new_text.splitlines(),
+        fromfile=f"a/{label}", tofile=f"b/{label}", lineterm="",
+    ))
+
+
+def _print_diff(diff: list, limit=None) -> bool:
+    """Prints the diff, returning True if it was cut short."""
+    shown = diff if limit is None else diff[:limit]
+    for line in shown:
+        print(sanitize(line))
+    if len(shown) < len(diff):
+        print(f"... [{len(diff) - len(shown)} more diff lines]")
+        return True
+    return False
+
+
+def request_write_approval(target: Path, workspace: Path, operation: str, old_text: str,
+                           new_text: str, warnings: list, old_is_binary: bool = False) -> bool:
+    """Shows the full change as a diff and asks the human to approve it."""
+    label = target.relative_to(workspace.resolve()).as_posix()
+    diff = _diff_lines("" if old_is_binary else old_text, new_text, label)
+    old_lines = "binary" if old_is_binary else str(len(old_text.splitlines()))
+
+    print("\n" + "=" * 60)
+    print("[HUMAN APPROVAL REQUIRED: FILE WRITE]")
+    print(f"Target Path: {sanitize(target)}")
+    print(f"Operation  : {sanitize(operation)}")
+    print(f"Size       : {len(new_text.encode('utf-8'))} bytes")
+    print(f"Lines      : {old_lines} -> {len(new_text.splitlines())}")
+    for warning in warnings:
+        print(f"!! WARNING : {warning}")
+    if old_is_binary:
+        print("!! WARNING : the existing file is binary and will be replaced; diff is against an empty file")
+    print("-" * 60)
+    truncated = _print_diff(diff, APPROVAL_DIFF_PREVIEW_LINES)
+    print("=" * 60)
+
+    prompt = "Allow write operation? [y/N" + ("/v = view full diff" if truncated else "") + "]: "
+    while True:
+        try:
+            decision = input(prompt).strip().lower()
+        except EOFError:
+            return False
+        if decision in ("y", "yes"):
+            return True
+        if decision == "v" and truncated:
+            _print_diff(diff)
+            continue
+        return False
 
 
 # ==================== chippy/sandbox.py ====================
@@ -190,87 +477,6 @@ def write_warnings(target: Path, workspace: Path) -> list:
     if is_secret(target, workspace):
         warnings.append("looks like a secrets file")
     return warnings
-
-
-# ==================== chippy/terminal.py ====================
-
-def sanitize(text) -> str:
-    """
-    Escapes control characters (ANSI escapes, carriage returns, bidi overrides) so
-    model output cannot redraw the terminal or spoof the approval prompt.
-    """
-    out = []
-    for ch in str(text):
-        if ch in "\n\t" or ch.isprintable():
-            out.append(ch)
-            continue
-        code = ord(ch)
-        if code <= 0xFF:
-            out.append(f"\\x{code:02x}")
-        elif code <= 0xFFFF:
-            out.append(f"\\u{code:04x}")
-        else:
-            out.append(f"\\U{code:08x}")
-    return "".join(out)
-
-
-def clip(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[:limit] + "..."
-
-
-# ==================== chippy/approval.py ====================
-
-def _diff_lines(old_text: str, new_text: str, label: str) -> list:
-    return list(difflib.unified_diff(
-        old_text.splitlines(), new_text.splitlines(),
-        fromfile=f"a/{label}", tofile=f"b/{label}", lineterm="",
-    ))
-
-
-def _print_diff(diff: list, limit=None) -> bool:
-    """Prints the diff, returning True if it was cut short."""
-    shown = diff if limit is None else diff[:limit]
-    for line in shown:
-        print(sanitize(line))
-    if len(shown) < len(diff):
-        print(f"... [{len(diff) - len(shown)} more diff lines]")
-        return True
-    return False
-
-
-def request_write_approval(target: Path, workspace: Path, operation: str, old_text: str,
-                           new_text: str, warnings: list, old_is_binary: bool = False) -> bool:
-    """Shows the full change as a diff and asks the human to approve it."""
-    label = target.relative_to(workspace.resolve()).as_posix()
-    diff = _diff_lines("" if old_is_binary else old_text, new_text, label)
-    old_lines = "binary" if old_is_binary else str(len(old_text.splitlines()))
-
-    print("\n" + "=" * 60)
-    print("[HUMAN APPROVAL REQUIRED: FILE WRITE]")
-    print(f"Target Path: {sanitize(target)}")
-    print(f"Operation  : {sanitize(operation)}")
-    print(f"Size       : {len(new_text.encode('utf-8'))} bytes")
-    print(f"Lines      : {old_lines} -> {len(new_text.splitlines())}")
-    for warning in warnings:
-        print(f"!! WARNING : {warning}")
-    if old_is_binary:
-        print("!! WARNING : the existing file is binary and will be replaced; diff is against an empty file")
-    print("-" * 60)
-    truncated = _print_diff(diff, APPROVAL_DIFF_PREVIEW_LINES)
-    print("=" * 60)
-
-    prompt = "Allow write operation? [y/N" + ("/v = view full diff" if truncated else "") + "]: "
-    while True:
-        try:
-            decision = input(prompt).strip().lower()
-        except EOFError:
-            return False
-        if decision in ("y", "yes"):
-            return True
-        if decision == "v" and truncated:
-            _print_diff(diff)
-            continue
-        return False
 
 
 # ==================== chippy/tools.py ====================
@@ -467,14 +673,20 @@ def tool_read_file(workspace: Path, file_path: str, offset=1, limit=READ_MAX_LIN
 
 
 @_tool_errors
-def tool_search_files(workspace: Path, pattern: str, path: str = ".", glob: str = "", ignore_case=False) -> dict:
-    """Regex search over text files, returning 'path:line: text' hits so the model can read just those lines."""
+def tool_search_files(workspace: Path, pattern: str, path: str = ".", glob: str = "",
+                      ignore_case=False, context=0) -> dict:
+    """
+    Regex search over text files, returning 'path:line: text' hits so the model can read
+    just those lines. With context, each hit is a block that also has the surrounding
+    lines, marked grep-style as 'path-line- text'.
+    """
     if not isinstance(pattern, str) or not pattern:
         return {"status": "error", "message": "'pattern' must be a non-empty string."}
     try:
         regex = re.compile(pattern, re.IGNORECASE if _as_bool(ignore_case) else 0)
     except re.error as e:
         return {"status": "error", "message": f"Invalid regular expression: {e}"}
+    context = max(0, min(_as_int(context, "context"), SEARCH_MAX_CONTEXT_LINES))
     root = check_listable(path or ".", workspace)
     if not root.exists():
         return {"status": "error", "message": f"Path '{path}' does not exist."}
@@ -498,14 +710,19 @@ def tool_search_files(workspace: Path, pattern: str, path: str = ".", glob: str 
         files_scanned += 1
         found = False
         with open(target, "r", encoding="utf-8", errors="replace", newline="") as f:
-            for line_no, (line, _) in enumerate(_iter_lines(f, READ_MAX_LINE_CHARS), start=1):
-                if not regex.search(line):
-                    continue
-                if len(matches) >= SEARCH_MAX_MATCHES:
-                    stop_reason = f"Showing the first {SEARCH_MAX_MATCHES} matches; narrow the pattern, 'path' or 'glob'."
-                    break
-                found = True
-                matches.append(f"{rel}:{line_no}: {clip(line.rstrip(), SEARCH_MAX_LINE_CHARS)}")
+            lines = [line.rstrip("\n") for line, _ in _iter_lines(f, READ_MAX_LINE_CHARS)]
+        for index, line in enumerate(lines):
+            if not regex.search(line):
+                continue
+            if len(matches) >= SEARCH_MAX_MATCHES:
+                stop_reason = f"Showing the first {SEARCH_MAX_MATCHES} matches; narrow the pattern, 'path' or 'glob'."
+                break
+            found = True
+            block = []
+            for i in range(max(0, index - context), min(len(lines), index + context + 1)):
+                mark = ":" if i == index else "-"
+                block.append(f"{rel}{mark}{i + 1}{mark} {clip(lines[i].rstrip(), SEARCH_MAX_LINE_CHARS)}")
+            matches.append("\n".join(block))
         files_matched += found
         if stop_reason:
             break
@@ -643,6 +860,10 @@ _REGISTRY = (
                 "path": {"type": "string", "description": "Relative file or directory to search. Defaults to the workspace root."},
                 "glob": {"type": "string", "description": "Only search files matching this pattern, e.g. '*.py' or 'src/*.ts'."},
                 "ignore_case": {"type": "boolean", "description": "Case-insensitive search."},
+                "context": {
+                    "type": "integer",
+                    "description": f"Lines of context to show around each match (0-{SEARCH_MAX_CONTEXT_LINES}). Defaults to 0.",
+                },
             },
             "required": ["pattern"],
         },
@@ -694,8 +915,9 @@ EXPLORE_TOOL = {"type": "function", "function": {
     "name": EXPLORE_TOOL_NAME,
     "description": (
         "Hand a context-gathering task to a read-only sub-agent with a fresh context. It searches and reads "
-        "the workspace and returns a compact brief: the relevant file:line ranges with verbatim snippets, "
-        "applicable AGENTS.md rules, assumptions, and the user's answers to any blocking questions. "
+        "the workspace and returns a compact brief: the relevant file:line ranges with their exact text "
+        "(copied from the files by the harness), applicable AGENTS.md rules, assumptions, and the user's "
+        "answers to any blocking questions. "
         "Use it before multi-file changes or when you don't know where the relevant code is; "
         "skip it for small, local tasks."
     ),
@@ -755,6 +977,273 @@ def dispatch_tool(name: str, raw_arguments, workspace: Path, allowed=None) -> di
     except TypeError as e:
         return {"status": "error", "message": f"Invalid arguments for {name}: {e}"}
     return handler(workspace, **args)
+
+
+UNCHANGED_READ_RESULT = {
+    "status": "success",
+    "unchanged": True,
+    "message": "You already read these lines earlier in this request and the file has not changed since; use that result.",
+}
+
+
+def _read_key(raw_arguments, workspace: Path):
+    """Identifies a read_file call's output: the file, the window and the file's current version."""
+    args, error = parse_tool_arguments(raw_arguments)
+    if error or not isinstance(args.get("file_path"), str):
+        return None
+    try:
+        target = check_readable(args["file_path"], workspace)
+        st = target.stat()
+        offset = _as_int(args.get("offset", 1), "offset")
+        limit = _as_int(args.get("limit", READ_MAX_LINES), "limit")
+    except (OSError, ValueError):  # PermissionError is an OSError
+        return None
+    return str(target), offset, limit, st.st_mtime_ns, st.st_size
+
+
+class ReadTracker:
+    """
+    Dispatches tool calls, answering a repeated read_file of the same unchanged lines
+    with a short note instead of the content again. Clear it whenever earlier tool
+    output may have left the conversation (elision or compaction).
+    """
+
+    def __init__(self):
+        self._seen = set()
+
+    def clear(self) -> None:
+        self._seen.clear()
+
+    def dispatch(self, name: str, raw_arguments, workspace: Path, allowed=None) -> dict:
+        key = _read_key(raw_arguments, workspace) if name == "read_file" else None
+        if key is not None and key in self._seen:
+            return dict(UNCHANGED_READ_RESULT)
+        result = dispatch_tool(name, raw_arguments, workspace, allowed)
+        if key is not None and result.get("status") == "success":
+            self._seen.add(key)
+        return result
+
+
+# ==================== chippy/compact.py ====================
+
+SUMMARY_PROMPT = """You compress the conversation of an engineering agent so it can continue the work with a much smaller context.
+Write a concise plain-text summary with these sections:
+1. User requests and preferences: what the user asked for, in their own words where it matters.
+2. Decisions and answers: choices made, and answers the user gave to questions.
+3. Work done: files created or changed, and what changed in each.
+4. Key findings: file:line locations, facts about the code, and AGENTS.md rules that apply.
+5. Current state and next steps: what was in progress and what remains.
+Do not copy file contents except very short snippets that are essential; files can be re-read."""
+
+COMPACTED_PREFIX = ("[Context compacted] The earlier conversation was replaced by this summary to save context. "
+                    "Re-read files with the tools when you need their exact contents.\n\n")
+COMPACTED_ACK = "Understood. I'll continue from this summary."
+
+
+def _last_user_index(messages: list):
+    return max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=None)
+
+
+def tail_start(messages: list, keep_steps: int) -> int:
+    """
+    Index where the verbatim tail begins: the last `keep_steps` model steps of the current
+    request, or the request's own user message if it has no more steps than that.
+    A tail never starts with a tool result, so cutting there keeps every tool call answered.
+    """
+    if keep_steps <= 0:
+        return len(messages)
+    last_user = _last_user_index(messages)
+    first = 0 if last_user is None else last_user + 1
+    steps = [i for i in range(first, len(messages)) if messages[i].get("role") == "assistant"]
+    if len(steps) > keep_steps:
+        return steps[-keep_steps]
+    return len(messages) if last_user is None else last_user
+
+
+def _stub_arguments(raw):
+    """Tool-call arguments with long string values replaced by a size note. Returns None if nothing changed."""
+    try:
+        args = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return json.dumps({"elided": f"{len(raw):,} chars of malformed arguments"}) if len(raw) >= ELIDE_ARG_MIN_CHARS else None
+    if not isinstance(args, dict):
+        return None
+    stubbed = {key: f"[{len(value):,} chars elided]" if isinstance(value, str) and len(value) >= ELIDE_ARG_MIN_CHARS else value
+               for key, value in args.items()}
+    return json.dumps(stubbed) if stubbed != args else None
+
+
+def elide_tool_output(messages: list, end: int, keep_briefs: bool = True) -> int:
+    """
+    Stubs bulky tool results and large tool-call arguments in messages[:end].
+    Explore briefs are kept unless keep_briefs is False. Returns the number of stubs made.
+    """
+    calls, elided = {}, 0
+    for index in range(min(end, len(messages))):
+        message = messages[index]
+        if message.get("tool_calls"):
+            new_calls = []
+            for call in message["tool_calls"]:
+                function = call.get("function") or {}
+                calls[call.get("id")] = function
+                stubbed = _stub_arguments(function.get("arguments"))
+                if stubbed is not None:
+                    call = {**call, "function": {**function, "arguments": stubbed}}
+                    elided += 1
+                new_calls.append(call)
+            messages[index] = {**message, "tool_calls": new_calls}
+        if message.get("role") != "tool" or (keep_briefs and message.get("name") == EXPLORE_TOOL_NAME):
+            continue
+        if len(message.get("content") or "") < ELIDE_MIN_CHARS:
+            continue
+        function = calls.get(message.get("tool_call_id"), {})
+        signature = f"{function.get('name') or message.get('name')}({clip(str(function.get('arguments') or ''), 200)})"
+        messages[index] = {**message, "content": json.dumps({
+            "status": "elided",
+            "message": f"Output of {signature} was removed to save context. Call the tool again if you still need it.",
+        })}
+        elided += 1
+    return elided
+
+
+def elide_stale_tool_results(messages: list) -> int:
+    """
+    Run when a new request starts: elides tool output from before the most recent request.
+    Doing it only at this boundary keeps the API's prompt cache valid within a request.
+    """
+    last_user = _last_user_index(messages)
+    return 0 if last_user is None else elide_tool_output(messages, last_user)
+
+
+def render_transcript(messages: list, max_chars: int) -> str:
+    """Plain-text transcript for the summarizer, with long parts clipped and the middle dropped if needed."""
+    parts = []
+    for message in messages:
+        role = message.get("role")
+        if role == "user":
+            parts.append(f"USER: {message.get('content') or ''}")
+        elif role == "assistant":
+            if message.get("content"):
+                parts.append(f"ASSISTANT: {message['content']}")
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                parts.append(f"TOOL CALL: {function.get('name')}"
+                             f"({clip(str(function.get('arguments') or ''), COMPACT_TRANSCRIPT_ARG_CHARS)})")
+        elif role == "tool":
+            parts.append(f"TOOL RESULT ({message.get('name')}): "
+                         f"{clip(str(message.get('content') or ''), COMPACT_TRANSCRIPT_RESULT_CHARS)}")
+    text = "\n\n".join(parts)
+    if len(text) <= max_chars:
+        return text
+    head = max_chars // 4
+    return text[:head] + "\n\n[... middle of the conversation omitted ...]\n\n" + text[-(max_chars - head):]
+
+
+def _summarize(messages: list, settings: Settings, usage: Usage, instructions: str) -> str:
+    max_chars = int(settings.context_limit * CHARS_PER_TOKEN * COMPACT_SUMMARY_INPUT_RATIO)
+    system = SUMMARY_PROMPT + (f"\n\nThe user asked the summary to focus on: {instructions}" if instructions else "")
+    for _ in range(3):
+        request = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": render_transcript(messages, max_chars)},
+        ]
+        try:
+            response, call_usage = call_llm_api(request, [], settings, source="compact")
+        except ContextLengthError:
+            max_chars //= 2
+            continue
+        usage.add(call_usage, "compact")
+        summary = (response.get("content") or "").strip()
+        if not summary:
+            raise LLMError("The model returned an empty summary.")
+        return summary
+    raise LLMError("The conversation is too large to summarize even after shortening it.")
+
+
+def compact_history(messages: list, settings: Settings, usage: Usage, keep_steps: int,
+                    mid_request: bool, instructions: str = "") -> bool:
+    """
+    Replaces everything between the system prompt and the verbatim tail with a summary.
+    If the current request's message gets summarized mid-request, it is repeated
+    verbatim so the model still has the user's exact instructions. Returns False if
+    there was nothing to compact. Raises LLMError if summarizing fails.
+    """
+    start = tail_start(messages, keep_steps)
+    if start <= 1:
+        return False
+    head, tail = messages[1:start], messages[start:]
+    summary = COMPACTED_PREFIX + _summarize(head, settings, usage, instructions)
+    last_user = _last_user_index(messages)
+    if mid_request and last_user is not None and 0 < last_user < start:
+        request = messages[last_user].get("content") or ""
+        # An earlier summary already carries the request, and the new summary is made from it.
+        if not request.startswith(COMPACTED_PREFIX):
+            summary += f"\n\nThe user's current request, verbatim:\n{request}"
+
+    new = [messages[0], {"role": "user", "content": summary}]
+    if (tail and tail[0].get("role") == "user") or (not tail and not mid_request):
+        new.append({"role": "assistant", "content": COMPACTED_ACK})
+    messages[:] = new + tail
+    return True
+
+
+class ContextMeter:
+    """
+    Tracks the conversation's size in tokens: the prompt size of the last model call
+    plus an estimate for what was added since. Reset it after history is rewritten.
+    """
+
+    def __init__(self):
+        self._last = None  # (number of messages sent, prompt tokens)
+
+    def record(self, sent_messages: int, usage: dict) -> None:
+        tokens = prompt_size(usage)
+        self._last = (sent_messages, tokens) if tokens else None
+
+    def reset(self) -> None:
+        self._last = None
+
+    def estimate(self, messages: list, tools: list) -> int:
+        if self._last and self._last[0] <= len(messages):
+            sent, tokens = self._last
+            return tokens + estimate_tokens(messages[sent:])
+        return estimate_tokens(messages) + estimate_tokens(tools)
+
+
+def ensure_room(messages: list, settings: Settings, usage: Usage, meter: ContextMeter, tools: list) -> bool:
+    """
+    Auto-compaction, run before each model call. Near the context limit, older tool
+    output is elided first; if that isn't enough, earlier conversation is summarized.
+    Returns True if the history changed.
+    """
+    limit = settings.context_limit
+    before = meter.estimate(messages, tools)
+    if before < limit * COMPACT_TRIGGER_RATIO:
+        return False
+    elided = elide_tool_output(messages, tail_start(messages, COMPACT_KEEP_STEPS), keep_briefs=False)
+    meter.reset()
+    summarized = False
+    if meter.estimate(messages, tools) > limit * COMPACT_TARGET_RATIO:
+        print("[Context] Near the context limit; summarizing earlier conversation...")
+        try:
+            summarized = compact_history(messages, settings, usage, COMPACT_KEEP_STEPS, mid_request=True)
+        except LLMError as e:
+            # Not fatal: the request goes ahead, and an overflow is still recovered from.
+            print(f"[Context] Summarizing failed ({clip(str(e), 200)}); continuing without it.")
+    after = meter.estimate(messages, tools)
+    if elided or summarized:
+        print(f"[Context] Auto-compacted: ~{before:,} -> ~{after:,} tokens (limit {limit:,}).")
+    return bool(elided or summarized)
+
+
+def recover_from_overflow(messages: list, settings: Settings, usage: Usage, meter: ContextMeter) -> bool:
+    """
+    After the API rejected a request as too long: elides all tool output and summarizes
+    everything but the system prompt. Returns True if the history changed.
+    """
+    elided = elide_tool_output(messages, len(messages), keep_briefs=False)
+    meter.reset()
+    return bool(compact_history(messages, settings, usage, keep_steps=0, mid_request=True) or elided)
 
 
 # ==================== chippy/context.py ====================
@@ -865,22 +1354,39 @@ def _render_prompt(intro: str, workspace: Path, agents_rules, tool_names, constr
     )
 
 
-def build_system_context(workspace: Path) -> tuple:
+EXPLORE_GUIDANCE = {
+    "auto": [
+        "Before multi-file changes, or when you don't know where the relevant code is, call explore: "
+        "it gathers context in a separate conversation and returns a compact brief. "
+        "For small, local tasks use search_files and read_file directly.",
+    ],
+    "always": [
+        "Every request starts with an explore call: describe the task and what you need to know in 'task'. "
+        "Call explore again later only if the brief turns out to be missing something.",
+    ],
+    "never": [],
+}
+EXPLORE_SNIPPET_GUIDANCE = (
+    "Snippets in an explore brief are copied from the files by the harness, so they are exact and can serve "
+    "as edit_file old_string; if an edit fails, the file changed since, so re-read the lines."
+)
+
+
+def build_system_context(workspace: Path, explore_mode: str = "auto") -> tuple:
     """Returns (system prompt for the main agent, AGENTS.md status)."""
     agents_status, agents_rules = load_agents_md(workspace)
+    explore_lines = EXPLORE_GUIDANCE[explore_mode] + ([EXPLORE_SNIPPET_GUIDANCE] if explore_mode != "never" else [])
+    tool_names = [*TOOL_HANDLERS] + ([EXPLORE_TOOL_NAME] if explore_mode != "never" else [])
     prompt = _render_prompt(
         "You are an engineering assistant working in a sandboxed directory environment.",
-        workspace, agents_rules, [*TOOL_HANDLERS, EXPLORE_TOOL_NAME],
+        workspace, agents_rules, tool_names,
         [
-            "Before multi-file changes, or when you don't know where the relevant code is, call explore: "
-            "it gathers context in a separate conversation and returns a compact brief. "
-            "For small, local tasks use search_files and read_file directly.",
-            "Snippets in an explore brief are verbatim and can serve as edit_file old_string; "
-            "if an edit fails, re-read the lines.",
+            *explore_lines,
             "Read a whole file before rewriting it with write_file. "
             "Prefer edit_file for changes to existing files; use write_file to create files or replace them entirely.",
             "Every write is shown to a human as a diff and may be rejected.",
-            "Tool output from older requests may be elided to save context; call the tool again if you need it.",
+            "Old tool output may be elided, and the conversation may be replaced by a summary, to save context; "
+            "call a tool again if you need its output.",
         ],
     )
     return prompt, agents_status
@@ -888,7 +1394,7 @@ def build_system_context(workspace: Path) -> tuple:
 
 EXPLORE_BRIEF_FORMAT = """{
   "summary": "one or two sentences: what the task touches and how",
-  "relevant": [{"file": "path", "lines": "40-62", "why": "...", "snippet": "verbatim text of those lines"}],
+  "relevant": [{"file": "path", "lines": "40-62", "why": "..."}],
   "rules": ["AGENTS.md L20-30: the rule, paraphrased"],
   "assumptions": ["things you deduced but did not confirm"],
   "open_questions": ["only questions that block the task and cannot be answered from the code"]
@@ -907,7 +1413,8 @@ def build_explorer_prompt(workspace: Path) -> str:
             "Collect the AGENTS.md rules that apply to the task (read the relevant sections if only an outline is shown).",
             "Resolve ambiguity by reading the code where you can. Ask open_questions only when the answer "
             "changes what should be done and the code cannot tell you; the user will be asked them.",
-            "Snippets must be copied exactly, whitespace included: they may be used as edit_file old_string.",
+            "Don't copy code into the brief: give exact 'lines' ranges and the harness attaches the text of each. "
+            "Make each range cover exactly what the task needs (e.g. the whole function to change).",
             "Keep the brief compact: include only what the task needs, not everything you read.",
             "When done, reply with ONLY a JSON object in this format (no prose, no code fence):\n"
             + EXPLORE_BRIEF_FORMAT,
@@ -915,131 +1422,20 @@ def build_explorer_prompt(workspace: Path) -> str:
     )
 
 
-# ==================== chippy/llm.py ====================
-
-RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
-
-
-class LLMError(Exception):
-    """The API call failed and retrying will not help. The conversation is left intact."""
-
-
-def _backoff_delay(attempt: int, retry_after=None) -> float:
-    if retry_after:
-        try:
-            return min(float(retry_after), HTTP_MAX_BACKOFF_SECONDS)
-        except ValueError:
-            pass  # HTTP-date form; fall back to exponential backoff
-    return min(2 ** attempt, HTTP_MAX_BACKOFF_SECONDS) * (0.5 + random.random() / 2)
-
-
-def _post_with_retries(url: str, body: bytes, headers: dict) -> bytes:
-    for attempt in range(HTTP_MAX_RETRIES + 1):
-        retry_after = None
-        try:
-            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
-                return resp.read()
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="replace")[:2000]
-            if e.code not in RETRYABLE_STATUS_CODES or attempt == HTTP_MAX_RETRIES:
-                raise LLMError(f"API error {e.code}: {detail}") from e
-            reason = f"HTTP {e.code}"
-            retry_after = e.headers.get("Retry-After") if e.headers else None
-        except (OSError, http.client.HTTPException) as e:  # URLError, timeouts, dropped connections
-            detail = getattr(e, "reason", None) or e
-            if attempt == HTTP_MAX_RETRIES:
-                raise LLMError(f"Network error: {detail}") from e
-            reason = f"network error: {detail}"
-        delay = _backoff_delay(attempt, retry_after)
-        print(f"[{reason}] retrying in {delay:.1f}s ({attempt + 1}/{HTTP_MAX_RETRIES})", file=sys.stderr)
-        time.sleep(delay)
-    raise AssertionError("unreachable")
-
-
-def _parse_response(raw: bytes) -> tuple:
-    """Returns (assistant message, usage dict; empty when the API reports none)."""
-    try:
-        data = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as e:
-        raise LLMError(f"API returned invalid JSON: {e}") from e
-    if isinstance(data, dict) and data.get("error"):
-        raise LLMError(f"API error: {data['error']}")
-    try:
-        message = data["choices"][0]["message"]
-    except (KeyError, IndexError, TypeError):
-        raise LLMError(f"Unexpected API response: {str(data)[:500]}") from None
-    if not isinstance(message, dict):
-        raise LLMError(f"Unexpected API response: {str(data)[:500]}")
-    usage = data.get("usage")
-    return message, usage if isinstance(usage, dict) else {}
-
-
-def call_llm_api(messages: list, tools: list, settings: Settings, tool_choice: str = "auto") -> tuple:
-    """
-    Sends the conversation and returns (assistant message, usage dict).
-    Raises LLMError on failure.
-    """
-    payload = {
-        "model": settings.model,
-        "messages": messages,
-        "tools": tools,
-        "tool_choice": tool_choice,
-    }
-    # Some models (e.g. reasoning models) reject temperature, so it is only sent when set.
-    if settings.temperature is not None:
-        payload["temperature"] = settings.temperature
-    headers = {"Content-Type": "application/json"}
-    if settings.api_key:
-        headers["Authorization"] = f"Bearer {settings.api_key}"
-
-    raw = _post_with_retries(settings.url, json.dumps(payload).encode("utf-8"), headers)
-    return _parse_response(raw)
-
-
-def _token_count(value) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
-
-
-@dataclass
-class Usage:
-    """Token counts summed over the model calls of one request, as reported by the API."""
-    calls: int = 0
-    explore_calls: int = 0
-    reported: int = 0
-    prompt_tokens: int = 0
-    cached_tokens: int = 0
-    completion_tokens: int = 0
-    peak_prompt_tokens: int = 0
-
-    def add(self, usage: dict, explore: bool = False) -> None:
-        self.calls += 1
-        self.explore_calls += explore
-        if not usage:
-            return
-        self.reported += 1
-        prompt = _token_count(usage.get("prompt_tokens"))
-        details = usage.get("prompt_tokens_details")
-        self.prompt_tokens += prompt
-        self.cached_tokens += _token_count(details.get("cached_tokens")) if isinstance(details, dict) else 0
-        self.completion_tokens += _token_count(usage.get("completion_tokens"))
-        self.peak_prompt_tokens = max(self.peak_prompt_tokens, prompt)
-
-    def summary(self) -> str:
-        calls = f"{self.calls} model call{'s' if self.calls != 1 else ''}"
-        if self.explore_calls:
-            calls += f" ({self.explore_calls} by explore)"
-        if not self.reported:
-            return f"[Usage] {calls}; the API did not report token counts."
-        return (f"[Usage] {calls} | prompt {self.prompt_tokens:,} tokens ({self.cached_tokens:,} cached)"
-                f" | completion {self.completion_tokens:,} | largest prompt {self.peak_prompt_tokens:,}")
-
-
 # ==================== chippy/explore.py ====================
 
-FINAL_STEP_PROMPT = "Step limit reached. Reply now with the JSON brief, based on what you found so far."
+FINAL_STEP_PROMPT = "Stop exploring now and reply with the JSON brief, based on what you found so far."
 SKIPPED_ANSWER = ("The user skipped these questions. Decide using your best judgement and state your "
                   "assumptions, or ask the user in your reply.")
+_LINE_RANGE = re.compile(r"\s*L?(\d+)\s*(?:-\s*L?(\d+))?\s*")
+
+
+class ExploreInterrupted(KeyboardInterrupt):
+    """Ctrl-C during explore. `result` lists what the explorer had looked at, for the caller's history."""
+
+    def __init__(self, result: dict):
+        super().__init__()
+        self.result = result
 
 
 def parse_brief(text: str):
@@ -1054,6 +1450,46 @@ def parse_brief(text: str):
     return brief if isinstance(brief, dict) else None
 
 
+def attach_snippets(brief: dict, workspace: Path) -> None:
+    """
+    Fills each 'relevant' entry's snippet with the exact text of its line range, read
+    from disk by the harness, so snippets are correct by construction and the explorer
+    never spends tokens copying code.
+    """
+    relevant = brief.get("relevant")
+    if not isinstance(relevant, list):
+        return
+    for entry in relevant:
+        if not isinstance(entry, dict):
+            continue
+        entry.pop("snippet", None)
+        match = _LINE_RANGE.fullmatch(str(entry.get("lines", "")))
+        start = int(match[1]) if match else 0
+        end = int(match[2] or match[1]) if match else 0
+        if not isinstance(entry.get("file"), str) or start < 1 or end < start:
+            entry["snippet_error"] = "No snippet: 'file' or the 'start-end' line range is missing or invalid."
+            continue
+        result = tool_read_file(workspace, entry["file"], offset=start, limit=min(end - start + 1, EXPLORE_SNIPPET_MAX_LINES))
+        if result.get("status") != "success":
+            entry["snippet_error"] = f"No snippet: {result.get('message')}"
+            continue
+        entry["snippet"] = result["content"]
+        if result["end_line"] < end:
+            entry["snippet_note"] = f"Only lines {start}-{result['end_line']} are included; read the rest with read_file."
+
+
+def _cap_read(raw_arguments):
+    """The explorer's read_file calls are capped at EXPLORE_READ_MAX_LINES, so one read can't fill its context."""
+    args, error = parse_tool_arguments(raw_arguments)
+    if error:
+        return raw_arguments
+    try:
+        limit = int(args.get("limit", EXPLORE_READ_MAX_LINES))
+    except (TypeError, ValueError):
+        return raw_arguments
+    return {**args, "limit": max(1, min(limit, EXPLORE_READ_MAX_LINES))}
+
+
 def _ask_open_questions(questions: list):
     """Puts the explorer's blocking questions to the user. Returns their answer, or None if skipped."""
     print("\n[Explore] Questions before the agent continues:")
@@ -1066,11 +1502,12 @@ def _ask_open_questions(questions: list):
     return answer or None
 
 
-def _finish(reply: str, steps: int) -> dict:
-    print(f"[Explore] Done in {steps} step{'s' if steps != 1 else ''}; brief is {len(reply):,} chars.")
+def _finish(reply: str, steps: int, workspace: Path) -> dict:
+    print(f"[Explore] Done in {steps} step{'s' if steps != 1 else ''}.")
     brief = parse_brief(reply)
     if brief is None:
         return {"status": "success", "steps": steps, "brief": reply or "(the explorer returned nothing)"}
+    attach_snippets(brief, workspace)
     questions = brief.get("open_questions")
     questions = [q for q in questions if q] if isinstance(questions, list) else []
     if questions:
@@ -1081,7 +1518,8 @@ def _finish(reply: str, steps: int) -> dict:
 def run_explore(raw_arguments, workspace: Path, settings: Settings, usage: Usage) -> dict:
     """
     Runs the explore tool: a read-only sub-agent with its own conversation and step budget.
-    Only its brief reaches the caller's context; the files it read do not.
+    Only its brief reaches the caller's context; the files it read do not. It is told to
+    report early if its own context reaches EXPLORE_CONTEXT_RATIO of the limit.
     """
     args, error = parse_tool_arguments(raw_arguments)
     if error:
@@ -1091,75 +1529,88 @@ def run_explore(raw_arguments, workspace: Path, settings: Settings, usage: Usage
         return {"status": "error", "message": "'task' must be a non-empty string."}
 
     sub_settings = dataclasses.replace(settings, model=settings.explore_model or settings.model)
+    budget = settings.context_limit * EXPLORE_CONTEXT_RATIO
     messages = [
         {"role": "system", "content": build_explorer_prompt(workspace)},
         {"role": "user", "content": task},
     ]
+    reads, explored = ReadTracker(), []
     print(f"[Explore] Using {sanitize(sub_settings.model)}")
     try:
         for step in range(1, settings.explore_max_steps + 2):
-            final = step > settings.explore_max_steps
+            final = step > settings.explore_max_steps or estimate_tokens(messages) > budget
             if final:
                 messages.append({"role": "user", "content": FINAL_STEP_PROMPT})
             response, call_usage = call_llm_api(messages, READ_ONLY_TOOLS, sub_settings,
-                                                tool_choice="none" if final else "auto")
-            usage.add(call_usage, explore=True)
+                                                tool_choice="none" if final else "auto", source="explore")
+            usage.add(call_usage, "explore")
             messages.append(response)
 
             tool_calls = response.get("tool_calls") or []
             if final or not tool_calls:
-                return _finish(response.get("content") or "", step)
+                return _finish(response.get("content") or "", step, workspace)
             for call in tool_calls:
                 function = call.get("function") or {}
                 name = function.get("name") or ""
-                raw_args = function.get("arguments")
-                print(f"  [explore] {sanitize(name)}({sanitize(clip(str(raw_args), 120))})")
-                result = dispatch_tool(name, raw_args, workspace, allowed=READ_ONLY_TOOL_NAMES)
+                raw_args = _cap_read(function.get("arguments")) if name == "read_file" else function.get("arguments")
+                signature = f"{name}({clip(str(function.get('arguments')), 120)})"
+                print(f"  [explore] {sanitize(signature)}")
+                result = reads.dispatch(name, raw_args, workspace, allowed=READ_ONLY_TOOL_NAMES)
+                explored.append(signature)
                 messages.append(tool_result_message(call, result))
     except LLMError as e:
         # Returned rather than raised: the caller's tool call still needs a result.
         return {"status": "error", "message": f"The explore sub-agent failed: {e}. Gather context directly instead."}
+    except KeyboardInterrupt:
+        raise ExploreInterrupted({
+            "status": "cancelled",
+            "message": "The user interrupted explore before it finished. It had looked at these, "
+                       "so you know where to start if you continue:",
+            "explored": explored,
+        }) from None
     raise AssertionError("unreachable")
 
 
 # ==================== chippy/agent.py ====================
 
 CANCELLED_RESULT = {"status": "cancelled", "message": "Not run: the user interrupted this turn."}
+COMMANDS_HELP = """Commands:
+  /compact [focus]  Summarize the conversation so far to free context (optionally say what to keep)
+  /usage            Token usage for this session and the current context size
+  /help             Show this help
+  exit, quit        Leave"""
 
 
-def elide_stale_tool_results(messages: list) -> int:
-    """
-    Replaces bulky tool output from before the most recent request with a short stub,
-    so files read long ago aren't resent with every call. Explore briefs are kept: they
-    are already compact. Meant to run only when a new request starts, since rewriting
-    history mid-request would defeat the API's prompt caching. Returns the number elided.
-    """
-    user_indexes = [i for i, m in enumerate(messages) if m.get("role") == "user"]
-    if not user_indexes:
-        return 0
-    calls, elided = {}, 0
-    for message in messages[:user_indexes[-1]]:
-        for call in message.get("tool_calls") or []:
-            calls[call.get("id")] = call.get("function") or {}
-        if message.get("role") != "tool" or message.get("name") == EXPLORE_TOOL_NAME:
-            continue
-        if len(message.get("content") or "") < ELIDE_MIN_CHARS:
-            continue
-        function = calls.get(message.get("tool_call_id"), {})
-        signature = f"{function.get('name') or message.get('name')}({clip(str(function.get('arguments') or ''), 200)})"
-        message["content"] = json.dumps({
-            "status": "elided",
-            "message": f"Output of {signature} from an earlier request was removed to save context. "
-                       "Call the tool again if you still need it.",
-        })
-        elided += 1
-    return elided
+def agent_tools(settings: Settings) -> list:
+    return TOOLS if settings.explore_mode == "never" else AGENT_TOOLS
 
 
-def _run_steps(messages: list, workspace: Path, settings: Settings, usage: Usage) -> None:
-    for _ in range(settings.max_steps):
-        response_msg, call_usage = call_llm_api(messages, AGENT_TOOLS, settings)
-        usage.add(call_usage)
+def _call_model(messages: list, tools: list, settings: Settings, usage: Usage, meter: ContextMeter,
+                tool_choice, reads: ReadTracker) -> dict:
+    """One model call. If the API rejects the prompt as too long, compacts everything and retries once."""
+    try:
+        response, call_usage = call_llm_api(messages, tools, settings, tool_choice)
+    except ContextLengthError:
+        print("[Context] The request exceeded the model's context window; compacting and retrying.")
+        if not recover_from_overflow(messages, settings, usage, meter):
+            raise
+        reads.clear()
+        response, call_usage = call_llm_api(messages, tools, settings, tool_choice)
+    meter.record(len(messages), call_usage)
+    usage.add(call_usage)
+    return response
+
+
+def _run_steps(messages: list, workspace: Path, settings: Settings, usage: Usage, meter: ContextMeter) -> None:
+    tools = agent_tools(settings)
+    reads = ReadTracker()
+    for step in range(settings.max_steps):
+        if ensure_room(messages, settings, usage, meter, tools):
+            reads.clear()
+        tool_choice = "auto"
+        if step == 0 and settings.explore_mode == "always":
+            tool_choice = {"type": "function", "function": {"name": EXPLORE_TOOL_NAME}}
+        response_msg = _call_model(messages, tools, settings, usage, meter, tool_choice, reads)
         messages.append(response_msg)
 
         content = response_msg.get("content") or ""
@@ -1176,12 +1627,14 @@ def _run_steps(messages: list, workspace: Path, settings: Settings, usage: Usage
             raw_args = function.get("arguments")
             print(f"[Tool Call] {sanitize(name)}({sanitize(clip(str(raw_args), 200))})")
             try:
-                if name == EXPLORE_TOOL_NAME:
+                if name == EXPLORE_TOOL_NAME and settings.explore_mode != "never":
                     result = run_explore(raw_args, workspace, settings, usage)
                 else:
-                    result = dispatch_tool(name, raw_args, workspace)
-            except KeyboardInterrupt:
-                for pending in tool_calls[index:]:
+                    result = reads.dispatch(name, raw_args, workspace)
+            except KeyboardInterrupt as interrupt:
+                # An interrupted explore still reports what it had looked at.
+                messages.append(tool_result_message(call, getattr(interrupt, "result", None) or CANCELLED_RESULT))
+                for pending in tool_calls[index + 1:]:
                     messages.append(tool_result_message(pending, CANCELLED_RESULT))
                 raise
             if result.get("status") != "success":
@@ -1192,39 +1645,89 @@ def _run_steps(messages: list, workspace: Path, settings: Settings, usage: Usage
           "Send another message to let the agent continue.\n")
 
 
-def run_turn(messages: list, workspace: Path, settings: Settings) -> None:
+def run_turn(messages: list, workspace: Path, settings: Settings, meter: ContextMeter = None,
+             session: Usage = None) -> None:
     """
     Alternates model calls and tool calls until the model answers without tools,
     or the step limit is reached. On KeyboardInterrupt every tool call the model
     already requested gets a result, so the history stays valid for the next request.
-    Token usage for the request is printed at the end, however it ends.
+    Token usage for the request is printed at the end, however it ends, and added to `session`.
     """
     usage = Usage()
     try:
-        _run_steps(messages, workspace, settings, usage)
+        _run_steps(messages, workspace, settings, usage, meter or ContextMeter())
     finally:
         if usage.calls:
             print(usage.summary() + "\n")
+        if session is not None:
+            session.merge(usage)
 
 
-def _discard_unanswered(messages: list) -> bool:
-    """Drops the user's message if nothing happened after it, so retrying doesn't send it twice."""
-    if messages and messages[-1].get("role") == "user":
+def _discard_unanswered(messages: list, user_input: str) -> bool:
+    """
+    Drops the user's message if nothing happened after it, so retrying doesn't send it twice.
+    Compares content too: after compaction the last message may be a summary, which must stay.
+    """
+    if messages and messages[-1] == {"role": "user", "content": user_input}:
         messages.pop()
         return True
     return False
 
 
+def _context_line(messages: list, settings: Settings, meter: ContextMeter) -> str:
+    size = meter.estimate(messages, agent_tools(settings))
+    return f"[Context] ~{size:,} of {settings.context_limit:,} tokens ({size * 100 // settings.context_limit}%)"
+
+
+def run_command(line: str, messages: list, settings: Settings, meter: ContextMeter, session: Usage) -> bool:
+    """Handles a /command typed at the prompt. Returns False if the line is not a known command."""
+    command, _, argument = line.partition(" ")
+    command = command.lower()
+    if command == "/help":
+        print(COMMANDS_HELP + "\n")
+    elif command == "/usage":
+        print(session.summary("[Session]") if session.calls else "[Session] No model calls yet.")
+        print(_context_line(messages, settings, meter) + "\n")
+    elif command == "/compact":
+        usage = Usage()
+        before = _context_line(messages, settings, meter)
+        try:
+            compacted = compact_history(messages, settings, usage, keep_steps=0, mid_request=False,
+                                        instructions=argument.strip())
+        except KeyboardInterrupt:
+            print("\n[Interrupted] The conversation was not changed.\n")
+            return True
+        except LLMError as e:
+            print(f"[Error] Compaction failed, the conversation was not changed: {e}\n", file=sys.stderr)
+            return True
+        finally:
+            session.merge(usage)
+        if compacted:
+            meter.reset()
+            print(f"{before}\n -> after compacting: {_context_line(messages, settings, meter)[len('[Context] '):]}\n")
+        else:
+            print("Nothing to compact yet.\n")
+    else:
+        return False
+    return True
+
+
 def run_agent(workspace: Path, settings: Settings) -> None:
-    system_prompt, agents_status = build_system_context(workspace)
+    system_prompt, agents_status = build_system_context(workspace, settings.explore_mode)
     messages = [{"role": "system", "content": system_prompt}]
+    meter, session = ContextMeter(), Usage()
 
     print("=" * 60)
     print(f"Directory Sandbox : {workspace.resolve()}")
     print("Shell Disabled    : True (Pure Python file APIs only)")
     print(f"AGENTS.md         : {agents_status}")
     print(f"Model             : {settings.model}")
-    print(f"Explore Model     : {settings.explore_model or settings.model}")
+    print(f"Context Limit     : {settings.context_limit:,} tokens (auto-compacts near the limit)")
+    explore = "off" if settings.explore_mode == "never" else f"{settings.explore_mode}, {settings.explore_model or settings.model}"
+    print(f"Explore           : {explore}")
+    if settings.log_path:
+        print(f"Usage Log         : {settings.log_path}")
+    print("Type /help for commands.")
     print("=" * 60 + "\n")
 
     while True:
@@ -1238,23 +1741,29 @@ def run_agent(workspace: Path, settings: Settings) -> None:
             continue
         if user_input.lower() in ("exit", "quit"):
             break
+        if user_input.startswith("/") and run_command(user_input, messages, settings, meter, session):
+            continue
 
         elided = elide_stale_tool_results(messages)
         if elided:
-            print(f"[Context] Elided {elided} tool result{'s' if elided != 1 else ''} from older requests.")
+            meter.reset()
+            print(f"[Context] Elided {elided} bulky tool output{'s' if elided != 1 else ''} from older requests.")
         messages.append({"role": "user", "content": user_input})
         try:
-            run_turn(messages, workspace, settings)
+            run_turn(messages, workspace, settings, meter, session)
         except KeyboardInterrupt:
             print("\n[Interrupted]")
         except LLMError as e:
             print(f"\n[Error] {e}", file=sys.stderr)
         else:
             continue
-        if _discard_unanswered(messages):
+        if _discard_unanswered(messages, user_input):
             print("Your last message was not sent; enter it again to retry.\n")
         else:
             print("Progress so far is kept; send a message to continue.\n")
+
+    if session.calls:
+        print(session.summary("[Session]"))
 
 
 # ==================== chippy/__main__.py ====================
@@ -1277,6 +1786,14 @@ def main(argv=None) -> int:
                              "(or the LLM_EXPLORE_MODEL environment variable).")
     parser.add_argument("--explore-max-steps", type=int, default=DEFAULT_EXPLORE_MAX_STEPS,
                         help="Maximum model calls for one explore run before it must report back.")
+    parser.add_argument("--explore", choices=EXPLORE_MODES, default="auto",
+                        help="auto: the agent decides when to explore; always: every request starts with "
+                             "an explore; never: no explore tool.")
+    parser.add_argument("--context-limit", type=int, default=os.getenv("LLM_CONTEXT_LIMIT", DEFAULT_CONTEXT_LIMIT),
+                        help="The model's context window in tokens; the conversation is compacted automatically "
+                             f"as it gets close (default {DEFAULT_CONTEXT_LIMIT:,}, or LLM_CONTEXT_LIMIT).")
+    parser.add_argument("--log", default="", metavar="PATH",
+                        help="Append one JSON line per model call (source, model, token usage) to this file.")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     args = parser.parse_args(argv)
@@ -1284,6 +1801,8 @@ def main(argv=None) -> int:
         parser.error("--max-steps must be at least 1")
     if args.explore_max_steps < 1:
         parser.error("--explore-max-steps must be at least 1")
+    if args.context_limit < MIN_CONTEXT_LIMIT:
+        parser.error(f"--context-limit must be at least {MIN_CONTEXT_LIMIT:,}")
 
     target_dir = Path(args.dir).resolve()
     if not target_dir.is_dir():
@@ -1298,6 +1817,9 @@ def main(argv=None) -> int:
         max_steps=args.max_steps,
         explore_model=args.explore_model,
         explore_max_steps=args.explore_max_steps,
+        explore_mode=args.explore,
+        context_limit=args.context_limit,
+        log_path=args.log,
     )
     run_agent(target_dir, settings)
     return 0

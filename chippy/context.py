@@ -122,22 +122,39 @@ def _render_prompt(intro: str, workspace: Path, agents_rules, tool_names, constr
     )
 
 
-def build_system_context(workspace: Path) -> tuple:
+EXPLORE_GUIDANCE = {
+    "auto": [
+        "Before multi-file changes, or when you don't know where the relevant code is, call explore: "
+        "it gathers context in a separate conversation and returns a compact brief. "
+        "For small, local tasks use search_files and read_file directly.",
+    ],
+    "always": [
+        "Every request starts with an explore call: describe the task and what you need to know in 'task'. "
+        "Call explore again later only if the brief turns out to be missing something.",
+    ],
+    "never": [],
+}
+EXPLORE_SNIPPET_GUIDANCE = (
+    "Snippets in an explore brief are copied from the files by the harness, so they are exact and can serve "
+    "as edit_file old_string; if an edit fails, the file changed since, so re-read the lines."
+)
+
+
+def build_system_context(workspace: Path, explore_mode: str = "auto") -> tuple:
     """Returns (system prompt for the main agent, AGENTS.md status)."""
     agents_status, agents_rules = load_agents_md(workspace)
+    explore_lines = EXPLORE_GUIDANCE[explore_mode] + ([EXPLORE_SNIPPET_GUIDANCE] if explore_mode != "never" else [])
+    tool_names = [*TOOL_HANDLERS] + ([EXPLORE_TOOL_NAME] if explore_mode != "never" else [])
     prompt = _render_prompt(
         "You are an engineering assistant working in a sandboxed directory environment.",
-        workspace, agents_rules, [*TOOL_HANDLERS, EXPLORE_TOOL_NAME],
+        workspace, agents_rules, tool_names,
         [
-            "Before multi-file changes, or when you don't know where the relevant code is, call explore: "
-            "it gathers context in a separate conversation and returns a compact brief. "
-            "For small, local tasks use search_files and read_file directly.",
-            "Snippets in an explore brief are verbatim and can serve as edit_file old_string; "
-            "if an edit fails, re-read the lines.",
+            *explore_lines,
             "Read a whole file before rewriting it with write_file. "
             "Prefer edit_file for changes to existing files; use write_file to create files or replace them entirely.",
             "Every write is shown to a human as a diff and may be rejected.",
-            "Tool output from older requests may be elided to save context; call the tool again if you need it.",
+            "Old tool output may be elided, and the conversation may be replaced by a summary, to save context; "
+            "call a tool again if you need its output.",
         ],
     )
     return prompt, agents_status
@@ -145,7 +162,7 @@ def build_system_context(workspace: Path) -> tuple:
 
 EXPLORE_BRIEF_FORMAT = """{
   "summary": "one or two sentences: what the task touches and how",
-  "relevant": [{"file": "path", "lines": "40-62", "why": "...", "snippet": "verbatim text of those lines"}],
+  "relevant": [{"file": "path", "lines": "40-62", "why": "..."}],
   "rules": ["AGENTS.md L20-30: the rule, paraphrased"],
   "assumptions": ["things you deduced but did not confirm"],
   "open_questions": ["only questions that block the task and cannot be answered from the code"]
@@ -164,7 +181,8 @@ def build_explorer_prompt(workspace: Path) -> str:
             "Collect the AGENTS.md rules that apply to the task (read the relevant sections if only an outline is shown).",
             "Resolve ambiguity by reading the code where you can. Ask open_questions only when the answer "
             "changes what should be done and the code cannot tell you; the user will be asked them.",
-            "Snippets must be copied exactly, whitespace included: they may be used as edit_file old_string.",
+            "Don't copy code into the brief: give exact 'lines' ranges and the harness attaches the text of each. "
+            "Make each range cover exactly what the task needs (e.g. the whole function to change).",
             "Keep the brief compact: include only what the task needs, not everything you read.",
             "When done, reply with ONLY a JSON object in this format (no prose, no code fence):\n"
             + EXPLORE_BRIEF_FORMAT,

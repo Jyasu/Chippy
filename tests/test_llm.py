@@ -1,7 +1,9 @@
 import io
 import json
+import tempfile
 import unittest
 import urllib.error
+from pathlib import Path
 from unittest import mock
 
 from support import FakeResponse, api_response, chippy as C, quiet
@@ -30,7 +32,7 @@ class CallLlmApiTests(unittest.TestCase):
     def test_retries_transient_errors(self):
         (message, usage), urlopen = self.call(http_error(503), urllib.error.URLError("reset"), FakeResponse(api_response("hi")))
         self.assertEqual(message["content"], "hi")
-        self.assertEqual(usage, {})
+        self.assertEqual(list(usage), ["estimated_prompt_tokens"])
         self.assertEqual(urlopen.call_count, 3)
         self.assertEqual(self.sleep.call_count, 2)
 
@@ -70,23 +72,55 @@ class CallLlmApiTests(unittest.TestCase):
     def test_returns_usage_and_sends_tool_choice(self):
         reported = {"prompt_tokens": 10, "completion_tokens": 2}
         with quiet(), mock.patch("urllib.request.urlopen", return_value=FakeResponse(api_response("hi", usage=reported))) as urlopen:
-            _, usage = C.call_llm_api([], [], self.settings, tool_choice="none")
+            _, usage = C.call_llm_api([], C.TOOLS, self.settings, tool_choice="none")
+            C.call_llm_api([], [], self.settings)
         self.assertEqual(usage, reported)
-        self.assertEqual(json.loads(urlopen.call_args.args[0].data)["tool_choice"], "none")
+        with_tools, without_tools = (json.loads(call.args[0].data) for call in urlopen.call_args_list)
+        self.assertEqual(with_tools["tool_choice"], "none")
+        # Servers reject tool_choice when no tools are sent.
+        self.assertNotIn("tool_choice", without_tools)
+        self.assertNotIn("tools", without_tools)
+
+    def test_context_length_error_is_distinguished(self):
+        body = b'{"error": {"code": "context_length_exceeded", "message": "maximum context length is 8192 tokens"}}'
+        error = urllib.error.HTTPError(URL, 400, "bad", {}, io.BytesIO(body))
+        with self.assertRaises(C.ContextLengthError):
+            self.call(error)
+        with self.assertRaises(C.LLMError) as ctx:
+            self.call(http_error(400))
+        self.assertNotIsInstance(ctx.exception, C.ContextLengthError)
+
+    def test_log_records_each_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "usage.jsonl"
+            settings = C.Settings(model="m", url=URL, log_path=str(log))
+            self.call(FakeResponse(api_response("hi", usage={"prompt_tokens": 3})), settings=settings)
+            record = json.loads(log.read_text())
+        self.assertEqual((record["source"], record["model"], record["usage"]), ("main", "m", {"prompt_tokens": 3}))
 
 
 class UsageTests(unittest.TestCase):
     def test_sums_calls_and_tracks_largest_prompt(self):
         usage = C.Usage()
         usage.add({"prompt_tokens": 100, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 80}})
-        usage.add({"prompt_tokens": 300, "completion_tokens": 7}, explore=True)
-        usage.add({"prompt_tokens": 200, "completion_tokens": None, "prompt_tokens_details": None})
-        self.assertEqual((usage.calls, usage.explore_calls), (3, 1))
+        usage.add({"prompt_tokens": 300, "completion_tokens": 7}, "explore")
+        usage.add({"prompt_tokens": 200, "completion_tokens": None, "prompt_tokens_details": None}, "compact")
+        self.assertEqual(usage.calls, 3)
         self.assertEqual((usage.prompt_tokens, usage.cached_tokens, usage.completion_tokens), (600, 80, 12))
         self.assertEqual(usage.peak_prompt_tokens, 300)
-        self.assertIn("3 model calls (1 by explore)", usage.summary())
+        self.assertIn("3 model calls (1 for compaction, 1 by explore)", usage.summary())
 
-    def test_unreported_usage(self):
+    def test_estimated_usage_is_marked(self):
         usage = C.Usage()
-        usage.add({})
-        self.assertIn("did not report", usage.summary())
+        usage.add({"estimated_prompt_tokens": 500})
+        summary = usage.summary()
+        self.assertIn("prompt ~500 tokens", summary)
+        self.assertIn("estimated for 1 call", summary)
+        self.assertNotIn("completion", summary)
+
+    def test_merge(self):
+        session, request = C.Usage(), C.Usage()
+        request.add({"prompt_tokens": 10, "completion_tokens": 1}, "explore")
+        session.merge(request)
+        session.merge(request)
+        self.assertEqual((session.calls, session.by_source, session.prompt_tokens), (2, {"explore": 2}, 20))

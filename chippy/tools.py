@@ -17,6 +17,7 @@ from chippy.config import (
     READ_MAX_CHARS,
     READ_MAX_LINE_CHARS,
     READ_MAX_LINES,
+    SEARCH_MAX_CONTEXT_LINES,
     SEARCH_MAX_FILE_BYTES,
     SEARCH_MAX_FILES,
     SEARCH_MAX_LINE_CHARS,
@@ -225,14 +226,20 @@ def tool_read_file(workspace: Path, file_path: str, offset=1, limit=READ_MAX_LIN
 
 
 @_tool_errors
-def tool_search_files(workspace: Path, pattern: str, path: str = ".", glob: str = "", ignore_case=False) -> dict:
-    """Regex search over text files, returning 'path:line: text' hits so the model can read just those lines."""
+def tool_search_files(workspace: Path, pattern: str, path: str = ".", glob: str = "",
+                      ignore_case=False, context=0) -> dict:
+    """
+    Regex search over text files, returning 'path:line: text' hits so the model can read
+    just those lines. With context, each hit is a block that also has the surrounding
+    lines, marked grep-style as 'path-line- text'.
+    """
     if not isinstance(pattern, str) or not pattern:
         return {"status": "error", "message": "'pattern' must be a non-empty string."}
     try:
         regex = re.compile(pattern, re.IGNORECASE if _as_bool(ignore_case) else 0)
     except re.error as e:
         return {"status": "error", "message": f"Invalid regular expression: {e}"}
+    context = max(0, min(_as_int(context, "context"), SEARCH_MAX_CONTEXT_LINES))
     root = check_listable(path or ".", workspace)
     if not root.exists():
         return {"status": "error", "message": f"Path '{path}' does not exist."}
@@ -256,14 +263,19 @@ def tool_search_files(workspace: Path, pattern: str, path: str = ".", glob: str 
         files_scanned += 1
         found = False
         with open(target, "r", encoding="utf-8", errors="replace", newline="") as f:
-            for line_no, (line, _) in enumerate(_iter_lines(f, READ_MAX_LINE_CHARS), start=1):
-                if not regex.search(line):
-                    continue
-                if len(matches) >= SEARCH_MAX_MATCHES:
-                    stop_reason = f"Showing the first {SEARCH_MAX_MATCHES} matches; narrow the pattern, 'path' or 'glob'."
-                    break
-                found = True
-                matches.append(f"{rel}:{line_no}: {clip(line.rstrip(), SEARCH_MAX_LINE_CHARS)}")
+            lines = [line.rstrip("\n") for line, _ in _iter_lines(f, READ_MAX_LINE_CHARS)]
+        for index, line in enumerate(lines):
+            if not regex.search(line):
+                continue
+            if len(matches) >= SEARCH_MAX_MATCHES:
+                stop_reason = f"Showing the first {SEARCH_MAX_MATCHES} matches; narrow the pattern, 'path' or 'glob'."
+                break
+            found = True
+            block = []
+            for i in range(max(0, index - context), min(len(lines), index + context + 1)):
+                mark = ":" if i == index else "-"
+                block.append(f"{rel}{mark}{i + 1}{mark} {clip(lines[i].rstrip(), SEARCH_MAX_LINE_CHARS)}")
+            matches.append("\n".join(block))
         files_matched += found
         if stop_reason:
             break
@@ -401,6 +413,10 @@ _REGISTRY = (
                 "path": {"type": "string", "description": "Relative file or directory to search. Defaults to the workspace root."},
                 "glob": {"type": "string", "description": "Only search files matching this pattern, e.g. '*.py' or 'src/*.ts'."},
                 "ignore_case": {"type": "boolean", "description": "Case-insensitive search."},
+                "context": {
+                    "type": "integer",
+                    "description": f"Lines of context to show around each match (0-{SEARCH_MAX_CONTEXT_LINES}). Defaults to 0.",
+                },
             },
             "required": ["pattern"],
         },
@@ -452,8 +468,9 @@ EXPLORE_TOOL = {"type": "function", "function": {
     "name": EXPLORE_TOOL_NAME,
     "description": (
         "Hand a context-gathering task to a read-only sub-agent with a fresh context. It searches and reads "
-        "the workspace and returns a compact brief: the relevant file:line ranges with verbatim snippets, "
-        "applicable AGENTS.md rules, assumptions, and the user's answers to any blocking questions. "
+        "the workspace and returns a compact brief: the relevant file:line ranges with their exact text "
+        "(copied from the files by the harness), applicable AGENTS.md rules, assumptions, and the user's "
+        "answers to any blocking questions. "
         "Use it before multi-file changes or when you don't know where the relevant code is; "
         "skip it for small, local tasks."
     ),
@@ -513,3 +530,48 @@ def dispatch_tool(name: str, raw_arguments, workspace: Path, allowed=None) -> di
     except TypeError as e:
         return {"status": "error", "message": f"Invalid arguments for {name}: {e}"}
     return handler(workspace, **args)
+
+
+UNCHANGED_READ_RESULT = {
+    "status": "success",
+    "unchanged": True,
+    "message": "You already read these lines earlier in this request and the file has not changed since; use that result.",
+}
+
+
+def _read_key(raw_arguments, workspace: Path):
+    """Identifies a read_file call's output: the file, the window and the file's current version."""
+    args, error = parse_tool_arguments(raw_arguments)
+    if error or not isinstance(args.get("file_path"), str):
+        return None
+    try:
+        target = check_readable(args["file_path"], workspace)
+        st = target.stat()
+        offset = _as_int(args.get("offset", 1), "offset")
+        limit = _as_int(args.get("limit", READ_MAX_LINES), "limit")
+    except (OSError, ValueError):  # PermissionError is an OSError
+        return None
+    return str(target), offset, limit, st.st_mtime_ns, st.st_size
+
+
+class ReadTracker:
+    """
+    Dispatches tool calls, answering a repeated read_file of the same unchanged lines
+    with a short note instead of the content again. Clear it whenever earlier tool
+    output may have left the conversation (elision or compaction).
+    """
+
+    def __init__(self):
+        self._seen = set()
+
+    def clear(self) -> None:
+        self._seen.clear()
+
+    def dispatch(self, name: str, raw_arguments, workspace: Path, allowed=None) -> dict:
+        key = _read_key(raw_arguments, workspace) if name == "read_file" else None
+        if key is not None and key in self._seen:
+            return dict(UNCHANGED_READ_RESULT)
+        result = dispatch_tool(name, raw_arguments, workspace, allowed)
+        if key is not None and result.get("status") == "success":
+            self._seen.add(key)
+        return result

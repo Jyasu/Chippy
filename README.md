@@ -9,22 +9,36 @@ clone, no install and no other files. Copy it (or open it raw and paste it into 
 on any machine and run:
 
 ```sh
-export OPENAI_API_KEY=...            # LLM_BASE_URL, LLM_MODEL and LLM_EXPLORE_MODEL are optional
+export OPENAI_API_KEY=...            # LLM_BASE_URL, LLM_MODEL, LLM_EXPLORE_MODEL and LLM_CONTEXT_LIMIT are optional
 python3 chippy.py -d path/to/project
 ```
 
+`chippy.py` is generated from the `chippy/` package. Don't edit it by hand.
+
+At the prompt, `/compact [focus]` summarizes the conversation to free context, `/usage`
+shows token usage for the session, and `/help` lists commands.
+
 ## Keeping context small
 
-- `search_files` finds `path:line` hits so the agent reads only the lines it needs.
-- `explore` hands context gathering to a read-only sub-agent with a fresh conversation
-  (optionally a cheaper model, `--explore-model`). Only its brief (file:line ranges, verbatim
-  snippets, applicable `AGENTS.md` rules, and your answers to any blocking questions) reaches
-  the main agent.
-- Bulky tool output older than the previous request is replaced by a stub.
-- A long `AGENTS.md` is sent as an outline of its sections, which the agent reads on demand.
-- Token usage is printed after every request.
-
-`chippy.py` is generated from the `chippy/` package. Don't edit it by hand.
+- **Targeted reads.** `search_files` (with optional context lines) finds `path:line` hits so
+  the agent reads only the lines it needs. Re-reading the same unchanged lines in one
+  request returns a short note instead of the text again.
+- **Explore.** `explore` hands context gathering to a read-only sub-agent with a fresh
+  conversation (optionally a cheaper model, `--explore-model`). Only its brief reaches the
+  main agent: file:line ranges whose exact text the harness copies from disk, applicable
+  `AGENTS.md` rules, and your answers to any blocking questions. `--explore auto|always|never`
+  controls when it runs.
+- **Elision.** Bulky tool output, and large `write_file`/`edit_file` arguments, older than
+  the previous request are replaced by stubs.
+- **Compaction.** Near `--context-limit` (default 128,000 tokens), older tool output is
+  elided, and if that isn't enough, earlier conversation is summarized. If the API still
+  rejects a request as too long, everything is compacted and the request retried once.
+- **AGENTS.md outline.** A long `AGENTS.md` is sent as an outline of its sections, which
+  the agent reads on demand.
+- **Measurement.** Token usage is printed after every request (estimated when the API
+  doesn't report it), and `--log PATH` writes one JSON line per model call.
+  `scripts/bench.py` runs reference tasks against a real model to compare settings or
+  harness changes.
 
 ## Layout
 
@@ -38,10 +52,12 @@ python3 chippy.py -d path/to/project
 | `chippy/tools.py` | File tools, their schemas and the dispatcher |
 | `chippy/context.py` | System prompts: inventory and `AGENTS.md` (verbatim or outline) |
 | `chippy/llm.py` | Chat completions client with timeouts and retries, token usage |
+| `chippy/compact.py` | Context window management: elision, summaries, size tracking |
 | `chippy/explore.py` | Read-only explore sub-agent that returns a compact brief |
-| `chippy/agent.py` | Interactive loop |
+| `chippy/agent.py` | Interactive loop and `/` commands |
 | `chippy/__main__.py` | CLI entry point |
 | `scripts/build.py` | Bundler: `chippy/` → `chippy.py` |
+| `scripts/bench.py` | Reference tasks for comparing token usage and success (needs an API key) |
 | `tests/` | `unittest` suite, runnable against the package or the bundle |
 
 ## Development

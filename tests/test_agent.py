@@ -107,7 +107,8 @@ class ExploreTests(WorkspaceTestCase):
         self.assertIn("app.py:1: def run():", requests[2]["messages"][-1]["content"])
 
         result = self.explore_result()
-        self.assertEqual(result["brief"]["relevant"][0]["file"], "app.py")
+        # The explorer's own snippet is replaced by the exact text from disk.
+        self.assertEqual(result["brief"]["relevant"][0]["snippet"], "def run():\n    pass\n")
         self.assertEqual(result["brief"]["user_answers"], "wrap it")
         # The search output stayed in the explorer's conversation.
         self.assertNotIn("search_files", json.dumps(self.messages))
@@ -144,6 +145,145 @@ class ExploreTests(WorkspaceTestCase):
         )
         self.assertEqual(self.explore_result()["status"], "error")
         self.assertEqual(self.messages[-1]["content"], "done")
+
+    def test_invalid_snippet_ranges_are_reported(self):
+        brief = {"relevant": [{"file": "app.py", "lines": "x"}, {"file": "missing.py", "lines": "1-2"},
+                              {"file": "app.py", "lines": "L2"}]}
+        self.run_with(
+            api_response(tool_calls=[tool_call("m1", "explore", {"task": "t"})]),
+            api_response(json.dumps(brief)),
+            api_response("done"),
+        )
+        bad_range, missing, single = self.explore_result()["brief"]["relevant"]
+        self.assertIn("invalid", bad_range["snippet_error"])
+        self.assertIn("does not exist", missing["snippet_error"])
+        self.assertEqual(single["snippet"], "    pass\n")
+
+    def test_explorer_reads_are_capped(self):
+        self.write("big.py", "".join(f"{i}\n" for i in range(C.EXPLORE_READ_MAX_LINES * 2)))
+        requests = self.run_with(
+            api_response(tool_calls=[tool_call("m1", "explore", {"task": "t"})]),
+            api_response(tool_calls=[tool_call("e1", "read_file", {"file_path": "big.py", "limit": 10_000})]),
+            api_response("{}"),
+            api_response("done"),
+        )
+        read = json.loads(requests[2]["messages"][-1]["content"])
+        self.assertEqual(read["end_line"], C.EXPLORE_READ_MAX_LINES)
+
+    def test_explorer_reports_early_when_its_context_is_full(self):
+        self.settings = C.Settings(model="main", url="http://llm.invalid", context_limit=C.MIN_CONTEXT_LIMIT)
+        self.write("big.py", "".join("y" * 150 + "\n" for _ in range(150)))
+        requests = self.run_with(
+            api_response(tool_calls=[tool_call("m1", "explore", {"task": "t"})]),
+            api_response(tool_calls=[tool_call("e1", "read_file", {"file_path": "big.py"})]),
+            api_response("{}"),
+            api_response("done"),
+        )
+        self.assertEqual(requests[2]["tool_choice"], "none")
+
+    def test_interrupt_returns_what_was_explored(self):
+        responses = [
+            FakeResponse(api_response(tool_calls=[tool_call("m1", "explore", {"task": "t"}),
+                                                  tool_call("m2", "list_directory", {"directory_path": "."})])),
+            FakeResponse(api_response(tool_calls=[tool_call("e1", "search_files", {"pattern": "run"})])),
+            KeyboardInterrupt(),
+        ]
+        with quiet(), mock.patch("urllib.request.urlopen", side_effect=responses), \
+                self.assertRaises(KeyboardInterrupt):
+            C.run_turn(self.messages, self.ws, self.settings)
+        result = self.explore_result()
+        self.assertEqual(result["status"], "cancelled")
+        self.assertIn("search_files", result["explored"][0])
+        self.assertEqual(json.loads(self.messages[-1]["content"])["status"], "cancelled")
+
+    def test_always_mode_forces_explore_first(self):
+        self.settings = C.Settings(model="main", url="http://llm.invalid", explore_mode="always")
+        requests = self.run_with(
+            api_response(tool_calls=[tool_call("m1", "explore", {"task": "t"})]),
+            api_response("{}"),
+            api_response("done"),
+        )
+        self.assertEqual(requests[0]["tool_choice"], {"type": "function", "function": {"name": "explore"}})
+        self.assertEqual(requests[2]["tool_choice"], "auto")
+
+    def test_never_mode_has_no_explore_tool(self):
+        self.settings = C.Settings(model="main", url="http://llm.invalid", explore_mode="never")
+        requests = self.run_with(
+            api_response(tool_calls=[tool_call("m1", "explore", {"task": "t"})]),
+            api_response("done"),
+        )
+        self.assertNotIn("explore", {t["function"]["name"] for t in requests[0]["tools"]})
+        self.assertIn("Unknown tool", self.explore_result()["message"])
+        prompt, _ = C.build_system_context(self.ws, "never")
+        self.assertNotIn("explore", prompt)
+
+
+class RepeatedReadTests(WorkspaceTestCase):
+    def test_identical_read_of_unchanged_file_is_short(self):
+        self.write("a.py", "x = 1\n")
+        read = tool_call("r1", "read_file", {"file_path": "a.py"})
+        again = tool_call("r2", "read_file", {"file_path": "a.py"})
+        messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
+        responses = [FakeResponse(api_response(tool_calls=[read])), FakeResponse(api_response(tool_calls=[again])),
+                     FakeResponse(api_response("done"))]
+        with quiet(), mock.patch("urllib.request.urlopen", side_effect=responses):
+            C.run_turn(messages, self.ws, C.Settings(model="m", url="http://llm.invalid"))
+        first, second = (json.loads(m["content"]) for m in messages if m["role"] == "tool")
+        self.assertEqual(first["content"], "x = 1\n")
+        self.assertTrue(second["unchanged"])
+
+    def test_tracker_rereads_after_a_change(self):
+        path = self.write("a.py", "x = 1\n")
+        tracker = C.ReadTracker()
+        tracker.dispatch("read_file", {"file_path": "a.py"}, self.ws)
+        path.write_text("x = 22\n")
+        self.assertEqual(tracker.dispatch("read_file", {"file_path": "a.py"}, self.ws)["content"], "x = 22\n")
+        self.assertTrue(tracker.dispatch("read_file", {"file_path": "a.py"}, self.ws)["unchanged"])
+        tracker.clear()
+        self.assertIn("content", tracker.dispatch("read_file", {"file_path": "a.py"}, self.ws))
+
+
+class ContextLimitTests(WorkspaceTestCase):
+    def setUp(self):
+        super().setUp()
+        self.settings = C.Settings(model="m", url="http://llm.invalid", context_limit=C.MIN_CONTEXT_LIMIT)
+
+    def run_with(self, messages, *bodies):
+        responses = [b if isinstance(b, Exception) else FakeResponse(b) for b in bodies]
+        with quiet(), mock.patch("urllib.request.urlopen", side_effect=responses) as urlopen:
+            C.run_turn(messages, self.ws, self.settings)
+        return [json.loads(call.args[0].data) for call in urlopen.call_args_list]
+
+    def test_auto_compaction_elides_first(self):
+        big = json.dumps({"status": "success", "content": "x" * C.MIN_CONTEXT_LIMIT * C.CHARS_PER_TOKEN})
+        messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": None, "tool_calls": [tool_call("a", "read_file", {"file_path": "a"})]},
+                    {"role": "tool", "tool_call_id": "a", "name": "read_file", "content": big},
+                    {"role": "assistant", "content": "ok"}, {"role": "user", "content": "second"}]
+        requests = self.run_with(messages, api_response("done"))
+        self.assertEqual(len(requests), 1)  # eliding was enough: no summary call
+        self.assertEqual(json.loads(messages[3]["content"])["status"], "elided")
+
+    def test_auto_compaction_summarizes_when_eliding_is_not_enough(self):
+        messages = [{"role": "system", "content": "s"},
+                    {"role": "user", "content": "first " + "x" * C.MIN_CONTEXT_LIMIT * C.CHARS_PER_TOKEN},
+                    {"role": "assistant", "content": "ok"}, {"role": "user", "content": "second"}]
+        requests = self.run_with(messages, api_response("SUMMARY"), api_response("done"))
+        self.assertNotIn("tools", requests[0])
+        self.assertIn("SUMMARY", requests[1]["messages"][1]["content"])
+        self.assertEqual(requests[1]["messages"][-1], {"role": "user", "content": "second"})
+        self.assertEqual(messages[-1]["content"], "done")
+
+    def test_overflow_is_recovered_by_compacting(self):
+        overflow = urllib.error.HTTPError("u", 400, "bad", {}, io.BytesIO(b'{"error": {"code": "context_length_exceeded"}}'))
+        messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "ok"}, {"role": "user", "content": "second"}]
+        requests = self.run_with(messages, overflow, api_response("SUMMARY"), api_response("done"))
+        self.assertEqual(len(requests), 3)
+        retried = requests[2]["messages"]
+        self.assertEqual([m["role"] for m in retried], ["system", "user"])
+        self.assertIn("verbatim:\nsecond", retried[1]["content"])
+        self.assertEqual(messages[-1]["content"], "done")
 
 
 class ElisionTests(unittest.TestCase):
@@ -184,3 +324,25 @@ class RunAgentTests(WorkspaceTestCase):
         sent = json.loads(urlopen.call_args.args[0].data)["messages"]
         self.assertEqual([m["role"] for m in sent], ["system", "user"])
         self.assertEqual(sent[1]["content"], "second")
+
+    def test_compact_and_usage_commands(self):
+        settings = C.Settings(model="m", url="http://llm.invalid")
+        responses = [FakeResponse(api_response("hi", usage={"prompt_tokens": 50, "completion_tokens": 2})),
+                     FakeResponse(api_response("SUMMARY")), FakeResponse(api_response("ok"))]
+        out = io.StringIO()
+        with redirect_stdout(out), mock.patch("urllib.request.urlopen", side_effect=responses) as urlopen, \
+                mock.patch("builtins.input", side_effect=["hello", "/compact keep names", "/usage", "next", EOFError()]):
+            C.run_agent(self.ws, settings)
+        summary_request, after = (json.loads(call.args[0].data) for call in urlopen.call_args_list[1:])
+        self.assertIn("keep names", summary_request["messages"][0]["content"])
+        self.assertEqual([m["role"] for m in after["messages"]], ["system", "user", "assistant", "user"])
+        self.assertIn("SUMMARY", after["messages"][1]["content"])
+        self.assertIn("[Session] 2 model calls (1 for compaction)", out.getvalue())
+        self.assertIn("after compacting", out.getvalue())
+
+    def test_unknown_slash_text_is_sent_to_the_model(self):
+        settings = C.Settings(model="m", url="http://llm.invalid")
+        with quiet(), mock.patch("urllib.request.urlopen", side_effect=[FakeResponse(api_response("ok"))]) as urlopen, \
+                mock.patch("builtins.input", side_effect=["/etc/hosts is what?", EOFError()]):
+            C.run_agent(self.ws, settings)
+        self.assertEqual(json.loads(urlopen.call_args.args[0].data)["messages"][-1]["content"], "/etc/hosts is what?")

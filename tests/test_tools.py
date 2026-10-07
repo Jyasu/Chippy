@@ -200,6 +200,12 @@ class SearchFilesTests(WorkspaceTestCase):
         self.assertEqual(result["matches"], [])
         self.assertIn("No matches", result["note"])
 
+    def test_context_lines(self):
+        self.write("a.py", "one\ntwo\nthree\nfour\n")
+        result = C.tool_search_files(self.ws, "three", context=1)
+        self.assertEqual(result["matches"], ["a.py-2- two\na.py:3: three\na.py-4- four"])
+        self.assertEqual(len(C.tool_search_files(self.ws, "one", context=99)["matches"][0].splitlines()), 4)
+
     def test_match_cap(self):
         self.write("many.txt", "hit\n" * (C.SEARCH_MAX_MATCHES + 5))
         result = C.tool_search_files(self.ws, "hit")
