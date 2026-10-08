@@ -45,6 +45,18 @@ class CallLlmApiTests(unittest.TestCase):
             self.call(http_error(400))
         self.assertEqual(self.urlopen.call_count, 1)
 
+    def test_auth_errors_explain_the_key(self):
+        with self.assertRaises(C.LLMError) as ctx:
+            self.call(http_error(401))
+        self.assertEqual((ctx.exception.status, self.urlopen.call_count), (401, 1))
+        self.assertIn("No API key was sent", str(ctx.exception))
+        self.assertIn("chippy.env", str(ctx.exception))
+
+        settings = C.Settings(model="m", url=URL, api_key="k", api_key_source="/opt/chippy.env")
+        with self.assertRaises(C.LLMError) as ctx:
+            self.call(http_error(403), settings=settings)
+        self.assertIn("refused the API key from /opt/chippy.env", str(ctx.exception))
+
     def test_gives_up_after_max_retries(self):
         with self.assertRaises(C.LLMError):
             self.call(*[http_error(503)] * (C.HTTP_MAX_RETRIES + 1))

@@ -47,7 +47,7 @@ class PolicyTests(WorkspaceTestCase):
             C.check_writable(".GIT/config", self.ws)
 
     def test_secret_files_unreadable(self):
-        for path in (".env", ".env.local", "keys/server.pem", "id_rsa", "deploy/id_ed25519.pub", ".netrc"):
+        for path in (".env", ".env.local", "keys/server.pem", "id_rsa", "deploy/id_ed25519.pub", ".netrc", "chippy.env"):
             with self.subTest(path=path), self.assertRaises(PermissionError):
                 C.check_readable(path, self.ws)
 

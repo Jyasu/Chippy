@@ -12,7 +12,7 @@ PROTECTED_DIR_NAMES = frozenset({".git"})
 SECRET_FILE_PATTERNS = (
     ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx",
     "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*",
-    ".netrc", ".npmrc", ".pypirc",
+    ".netrc", ".npmrc", ".pypirc", "chippy.env",
 )
 SECRET_FILE_EXCEPTIONS = (".env.example", ".env.sample", ".env.template")
 

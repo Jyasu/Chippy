@@ -340,6 +340,18 @@ class RunAgentTests(WorkspaceTestCase):
         self.assertIn("[Session] 2 model calls (1 for compaction)", out.getvalue())
         self.assertIn("after compacting", out.getvalue())
 
+    def test_banner_shows_endpoint_and_key_source(self):
+        for settings, expected in (
+            (C.Settings(model="m", url="http://llm.invalid"), "API Key           : NOT SET"),
+            (C.Settings(model="m", url="http://llm.invalid", api_key="k", api_key_source="/opt/chippy.env"),
+             "API Key           : from /opt/chippy.env"),
+        ):
+            out = io.StringIO()
+            with redirect_stdout(out), mock.patch("builtins.input", side_effect=EOFError()):
+                C.run_agent(self.ws, settings)
+            self.assertIn("Endpoint          : http://llm.invalid", out.getvalue())
+            self.assertIn(expected, out.getvalue())
+
     def test_unknown_slash_text_is_sent_to_the_model(self):
         settings = C.Settings(model="m", url="http://llm.invalid")
         with quiet(), mock.patch("urllib.request.urlopen", side_effect=[FakeResponse(api_response("ok"))]) as urlopen, \

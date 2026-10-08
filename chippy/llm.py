@@ -10,14 +10,17 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from chippy.config import (
+    API_KEY_ENV,
     CHARS_PER_TOKEN,
     HTTP_MAX_BACKOFF_SECONDS,
     HTTP_MAX_RETRIES,
     HTTP_TIMEOUT_SECONDS,
     Settings,
 )
+from chippy.envfile import ENV_FILE_NAME
 
 RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+AUTH_STATUS_CODES = frozenset({401, 403})
 # How OpenAI-compatible servers word "the prompt is larger than the context window".
 CONTEXT_ERROR_MARKERS = (
     "context_length_exceeded", "maximum context length", "context length", "context window",
@@ -27,6 +30,10 @@ CONTEXT_ERROR_MARKERS = (
 
 class LLMError(Exception):
     """The API call failed and retrying will not help. The conversation is left intact."""
+
+    def __init__(self, message: str, status: int = None):
+        super().__init__(message)
+        self.status = status  # HTTP status, when the server answered with an error
 
 
 class ContextLengthError(LLMError):
@@ -57,9 +64,9 @@ def _post_with_retries(url: str, body: bytes, headers: dict) -> bytes:
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")[:2000]
             if e.code in (400, 413) and any(marker in detail.lower() for marker in CONTEXT_ERROR_MARKERS):
-                raise ContextLengthError(f"API error {e.code}: {detail}") from e
+                raise ContextLengthError(f"API error {e.code}: {detail}", e.code) from e
             if e.code not in RETRYABLE_STATUS_CODES or attempt == HTTP_MAX_RETRIES:
-                raise LLMError(f"API error {e.code}: {detail}") from e
+                raise LLMError(f"API error {e.code}: {detail}", e.code) from e
             reason = f"HTTP {e.code}"
             retry_after = e.headers.get("Retry-After") if e.headers else None
         except (OSError, http.client.HTTPException) as e:  # URLError, timeouts, dropped connections
@@ -109,6 +116,14 @@ def _log_call(settings: Settings, source: str, messages: list, usage: dict) -> N
         print(f"[Log] Could not write {settings.log_path}: {e}", file=sys.stderr)
 
 
+def _auth_hint(settings: Settings) -> str:
+    if not settings.api_key:
+        return (f"No API key was sent. Set the {API_KEY_ENV} environment variable, or put "
+                f"{API_KEY_ENV}=<key> in {ENV_FILE_NAME} next to chippy.py (see --help).")
+    return (f"The server refused the API key from {settings.api_key_source or API_KEY_ENV}. "
+            f"Check that it is valid for {settings.url} and model {settings.model}.")
+
+
 def call_llm_api(messages: list, tools: list, settings: Settings, tool_choice="auto", source: str = "main") -> tuple:
     """
     Sends the conversation and returns (assistant message, usage dict). When the API
@@ -127,7 +142,12 @@ def call_llm_api(messages: list, tools: list, settings: Settings, tool_choice="a
     if settings.api_key:
         headers["Authorization"] = f"Bearer {settings.api_key}"
 
-    raw = _post_with_retries(settings.url, json.dumps(payload).encode("utf-8"), headers)
+    try:
+        raw = _post_with_retries(settings.url, json.dumps(payload).encode("utf-8"), headers)
+    except LLMError as e:
+        if e.status in AUTH_STATUS_CODES:
+            raise LLMError(f"{e}\n{_auth_hint(settings)}", e.status) from e
+        raise
     message, usage = _parse_response(raw)
     if not usage:
         usage = {"estimated_prompt_tokens": estimate_tokens(messages) + estimate_tokens(tools)}

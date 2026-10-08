@@ -10,8 +10,9 @@ from chippy.compact import (
     ensure_room,
     recover_from_overflow,
 )
-from chippy.config import Settings
+from chippy.config import API_KEY_ENV, Settings
 from chippy.context import build_system_context
+from chippy.envfile import ENV_FILE_NAME
 from chippy.explore import run_explore
 from chippy.llm import ContextLengthError, LLMError, Usage, call_llm_api
 from chippy.terminal import clip, sanitize
@@ -165,7 +166,13 @@ def run_agent(workspace: Path, settings: Settings) -> None:
     print(f"Directory Sandbox : {workspace.resolve()}")
     print("Shell Disabled    : True (Pure Python file APIs only)")
     print(f"AGENTS.md         : {agents_status}")
+    print(f"Endpoint          : {settings.url}")
     print(f"Model             : {settings.model}")
+    if settings.api_key:
+        print(f"API Key           : from {settings.api_key_source or API_KEY_ENV}")
+    else:
+        print(f"API Key           : NOT SET - requests are sent without one. Set {API_KEY_ENV}, "
+              f"or put it in {ENV_FILE_NAME} next to chippy.py (see --help).")
     print(f"Context Limit     : {settings.context_limit:,} tokens (auto-compacts near the limit)")
     explore = "off" if settings.explore_mode == "never" else f"{settings.explore_mode}, {settings.explore_model or settings.model}"
     print(f"Explore           : {explore}")

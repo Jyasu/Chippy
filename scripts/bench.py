@@ -8,7 +8,8 @@ approves every write automatically, skips explore questions, then checks the res
 Checks import the edited fixture in a subprocess, so they run code the model wrote,
 inside the temporary copy.
 
-Needs OPENAI_API_KEY (LLM_BASE_URL and LLM_MODEL are optional, as for chippy itself).
+Needs OPENAI_API_KEY (LLM_BASE_URL and LLM_MODEL are optional), from the environment or
+chippy.env at the repo root, as for chippy itself.
 
 Usage:
     python3 scripts/bench.py                              # every task, explore auto and never
@@ -34,8 +35,11 @@ sys.path.insert(0, str(ROOT))
 
 from chippy.agent import run_turn  # noqa: E402
 from chippy.compact import ContextMeter  # noqa: E402
-from chippy.config import API_KEY_ENV, DEFAULT_CONTEXT_LIMIT, DEFAULT_MODEL, DEFAULT_URL, EXPLORE_MODES, Settings  # noqa: E402
+from chippy.config import (  # noqa: E402
+    API_KEY_ENV, DEFAULT_CONTEXT_LIMIT, DEFAULT_MODEL, DEFAULT_URL, EXPLORE_MODES, MODEL_ENV, URL_ENV, Settings,
+)
 from chippy.context import build_system_context  # noqa: E402
+from chippy.envfile import EnvFileError, default_env_file, load_env_file  # noqa: E402
 from chippy.llm import LLMError, Usage  # noqa: E402
 
 FIXTURE = {
@@ -211,13 +215,18 @@ def print_table(results: list) -> None:
 
 
 def main(argv=None) -> int:
+    try:
+        load_env_file(default_env_file())
+    except EnvFileError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
     parser = argparse.ArgumentParser(description="Compare chippy's token usage and success on reference tasks.")
     parser.add_argument("--tasks", default=",".join(t.name for t in TASKS), help="Comma-separated task names.")
     parser.add_argument("--modes", default="auto,never", help="Comma-separated explore modes to compare.")
     parser.add_argument("--repeat", type=int, default=1, help="Runs per task and mode (models are not deterministic).")
-    parser.add_argument("-m", "--model", default=DEFAULT_MODEL)
+    parser.add_argument("-m", "--model", default=os.getenv(MODEL_ENV) or DEFAULT_MODEL)
     parser.add_argument("--explore-model", default="")
-    parser.add_argument("--url", default=DEFAULT_URL)
+    parser.add_argument("--url", default=os.getenv(URL_ENV) or DEFAULT_URL)
     parser.add_argument("--context-limit", type=int, default=DEFAULT_CONTEXT_LIMIT)
     parser.add_argument("--json", metavar="PATH", help="Also write the results to this file.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Show the agent's output.")

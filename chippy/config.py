@@ -1,14 +1,18 @@
 """Defaults, limits and runtime settings shared across the harness."""
 
-import os
 from dataclasses import dataclass
 from typing import Optional
 
-DEFAULT_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1/chat/completions")
-DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
-# Empty means the explore sub-agent uses the main model.
-DEFAULT_EXPLORE_MODEL = os.getenv("LLM_EXPLORE_MODEL", "")
-# The key is only read from the environment: CLI arguments leak into shell history and `ps`.
+DEFAULT_URL = "https://api.openai.com/v1/chat/completions"
+DEFAULT_MODEL = "gpt-4o"
+
+# Settings read from the environment or chippy.env; command-line options win over them.
+# They are read at startup, after chippy.env is loaded, not at import time.
+URL_ENV = "LLM_BASE_URL"
+MODEL_ENV = "LLM_MODEL"
+EXPLORE_MODEL_ENV = "LLM_EXPLORE_MODEL"
+CONTEXT_LIMIT_ENV = "LLM_CONTEXT_LIMIT"
+# The key is never a command-line option: arguments leak into shell history and `ps`.
 API_KEY_ENV = "OPENAI_API_KEY"
 
 # Tool output limits keep a single call from flooding the model's context.
@@ -70,6 +74,7 @@ class Settings:
     model: str
     url: str
     api_key: str = ""
+    api_key_source: str = ""    # where the key came from, for the banner and auth error hints
     temperature: Optional[float] = None
     max_steps: int = DEFAULT_MAX_STEPS
     explore_model: str = ""

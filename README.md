@@ -13,6 +13,37 @@ export OPENAI_API_KEY=...            # LLM_BASE_URL, LLM_MODEL, LLM_EXPLORE_MODE
 python3 chippy.py -d path/to/project
 ```
 
+On Windows, `export` doesn't exist. In PowerShell:
+
+```powershell
+$env:OPENAI_API_KEY = "..."
+python chippy.py -d path\to\project
+```
+
+In cmd, use `set OPENAI_API_KEY=...` (no quotes).
+
+### Without environment variables
+
+If you can't set environment variables, put the settings in a file named `chippy.env`
+next to `chippy.py`:
+
+```ini
+# chippy.env: one NAME=value per line
+OPENAI_API_KEY=...
+LLM_BASE_URL=https://api.example.com/v1/chat/completions
+LLM_MODEL=gpt-4o
+```
+
+You can also keep the file somewhere else and pass `--env-file PATH`. Environment variables
+override the file, and command-line options override both. The file can set any variable,
+for example `HTTPS_PROXY`. The agent can't read a file named `chippy.env`, even inside the
+project. Keep the file out of version control. The API key is never accepted as a
+command-line option, because it would be saved in shell history and visible in the
+process list.
+
+At startup, chippy prints the endpoint and where the API key came from. If no key is set,
+it says so before you send anything.
+
 `chippy.py` is generated from the `chippy/` package. Don't edit it by hand.
 
 At the prompt, `/compact [focus]` summarizes the conversation to free context, `/usage`
